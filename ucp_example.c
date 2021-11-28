@@ -57,15 +57,28 @@ struct msg {
     uint64_t        data_len;
 };
 
-struct ucx_context {
+struct ucp_request_context {
     int             completed;
 };
 
-enum ucp_test_mode_t {
-    TEST_MODE_PROBE,
-    TEST_MODE_WAIT,
-    TEST_MODE_EVENTFD
-} ucp_test_mode = TEST_MODE_PROBE;
+enum ucp_example_wakeup_mode_t {
+    WAKEUP_MODE_PROBE,
+    WAKEUP_MODE_WAIT,
+    WAKEUP_MODE_EVENTFD
+} ucp_wakeup_mode = WAKEUP_MODE_PROBE;
+
+enum ucp_example_connect_mode_t {
+    CONNECT_MODE_ADDRESS,
+    CONNECT_MODE_LISTENER
+} ucp_connect_mode = CONNECT_MODE_ADDRESS;
+
+enum ucp_example_communication_mode_t {
+    COMMUNICATION_MODE_TAG,
+    COMMUNICATION_MODE_RMA,
+    COMMUNICATION_MODE_AM,
+    COMMUNICATION_MODE_STREAM
+} ucp_communication_mode = COMMUNICATION_MODE_TAG;
+
 
 static struct err_handling {
     ucp_err_handling_mode_t ucp_err_mode;
@@ -92,13 +105,13 @@ static void set_msg_data_len(struct msg *msg, uint64_t data_len)
 
 static void request_init(void *request)
 {
-    struct ucx_context *ctx = (struct ucx_context *) request;
+    struct ucp_request_context *ctx = (struct ucp_request_context *) request;
     ctx->completed = 0;
 }
 
 static void send_handler(void *request, ucs_status_t status, void *ctx)
 {
-    struct ucx_context *context = (struct ucx_context *) ctx;
+    struct ucp_request_context *context = (struct ucp_request_context *) ctx;
 
     context->completed = 1;
 
@@ -119,7 +132,7 @@ static void failure_handler(void *arg, ucp_ep_h ep, ucs_status_t status)
 static void recv_handler(void *request, ucs_status_t status,
                         ucp_tag_recv_info_t *info)
 {
-    struct ucx_context *context = (struct ucx_context *) request;
+    struct ucp_request_context *context = (struct ucp_request_context *) request;
 
     context->completed = 1;
 
@@ -128,7 +141,7 @@ static void recv_handler(void *request, ucs_status_t status,
            info->length);
 }
 
-static void ucx_wait(ucp_worker_h ucp_worker, struct ucx_context *context)
+static void ucx_wait(ucp_worker_h ucp_worker, struct ucp_request_context *context)
 {
     while (context->completed == 0) {
         ucp_worker_progress(ucp_worker);
@@ -186,8 +199,8 @@ static int run_ucx_client(ucp_worker_h ucp_worker)
     ucp_ep_h server_ep;
     ucp_ep_params_t ep_params;
     struct msg *msg = 0;
-    struct ucx_context *request;
-    struct ucx_context ctx;
+    struct ucp_request_context *request;
+    struct ucp_request_context ctx;
     size_t msg_len = 0;
     int ret = -1;
     char *str;
@@ -249,11 +262,11 @@ static int run_ucx_client(ucp_worker_h ucp_worker)
          * Following blocked methods used to polling internal file descriptor
          * to make CPU idle and don't spin loop
          */
-        if (ucp_test_mode == TEST_MODE_WAIT) {
+        if (ucp_wakeup_mode == WAKEUP_MODE_WAIT) {
             /* Polling incoming events*/
             status = ucp_worker_wait(ucp_worker);
             CHKERR_JUMP(status != UCS_OK, "ucp_worker_wait\n", err_ep);
-        } else if (ucp_test_mode == TEST_MODE_EVENTFD) {
+        } else if (ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
             status = test_poll_wait(ucp_worker);
             CHKERR_JUMP(status != UCS_OK, "test_poll_wait\n", err_ep);
         }
@@ -339,8 +352,8 @@ static int run_ucx_server(ucp_worker_h ucp_worker)
     ucp_ep_h client_ep;
     ucp_ep_params_t ep_params;
     struct msg *msg = 0;
-    struct ucx_context *request = 0;
-    struct ucx_context ctx;
+    struct ucp_request_context *request = 0;
+    struct ucp_request_context ctx;
     size_t msg_len = 0;
     int ret;
 
@@ -449,12 +462,61 @@ static int run_test(const char *client_target_name, ucp_worker_h ucp_worker)
     }
 }
 
+ucs_status_t createUcpContext(ucp_context_h& ucp_context){
+    ucp_params_t ucp_params;
+    ucp_config_t *config;
+    ucs_status_t status;
+
+    memset(&ucp_params, 0, sizeof(ucp_params));
+    status = ucp_config_read(NULL, NULL, &config);
+    if(status != UCS_OK) {return status;}
+    //? 这里request size相关还有必要设置吗 在有nbx的情况
+    ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
+                              UCP_PARAM_FIELD_REQUEST_SIZE |
+                              UCP_PARAM_FIELD_REQUEST_INIT;
+    switch(ucp_communication_mode){
+        case COMMUNICATION_MODE_RMA:ucp_params.features = UCP_FEATURE_RMA; break;
+        case COMMUNICATION_MODE_AM:ucp_params.features = UCP_FEATURE_AM; break;
+        case COMMUNICATION_MODE_STREAM:ucp_params.features = UCP_FEATURE_STREAM; break;
+        case COMMUNICATION_MODE_TAG:
+        default:ucp_params.features = UCP_FEATURE_TAG;
+    }
+    if (ucp_wakeup_mode == WAKEUP_MODE_WAIT || ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
+        ucp_params.features |= UCP_FEATURE_WAKEUP;
+    }
+    ucp_params.request_size    = sizeof(struct ucp_request_context);
+    ucp_params.request_init    = request_init;
+
+    status = ucp_init(&ucp_params, config, &ucp_context);
+    return status;
+}
+
+ucs_status_t createUcpWorker(ucp_context_h& ucp_context, ucp_worker_h& ucp_worker){
+    ucp_worker_params_t worker_params;
+    ucs_status_t status;
+
+    memset(&worker_params, 0, sizeof(worker_params));
+    worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
+    worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
+
+    status = ucp_worker_create(ucp_context, &worker_params, &ucp_worker);
+    return status;
+}
+
+ucs_status_t exchangeWorkerAddresses(ucp_worker_h& ucp_worker){
+    ucs_status_t status;
+    status = ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_len);
+    if(status != UCS_OK){return status;}
+    
+}
+
+
 int main(int argc, char **argv)
 {
     /* UCP temporary vars */
-    ucp_params_t ucp_params;
-    ucp_worker_params_t worker_params;
-    ucp_config_t *config;
+    // ucp_params_t ucp_params;
+    // ucp_worker_params_t worker_params;
+    // ucp_config_t *config;
     ucs_status_t status;
 
     /* UCP handler objects */
@@ -467,46 +529,50 @@ int main(int argc, char **argv)
     int oob_sock = -1;
     int ret = -1;
 
-    memset(&ucp_params, 0, sizeof(ucp_params));
-    memset(&worker_params, 0, sizeof(worker_params));
+    // memset(&ucp_params, 0, sizeof(ucp_params));
+    // memset(&worker_params, 0, sizeof(worker_params));
 
     /* Parse the command line */
     status = parse_cmd(argc, argv, &client_target_name);
     CHKERR_JUMP(status != UCS_OK, "parse_cmd\n", err);
 
     /* UCP initialization */
-    status = ucp_config_read(NULL, NULL, &config);
-    CHKERR_JUMP(status != UCS_OK, "ucp_config_read\n", err);
+    // status = ucp_config_read(NULL, NULL, &config);
+    // CHKERR_JUMP(status != UCS_OK, "ucp_config_read\n", err);
 
-    ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
-                              UCP_PARAM_FIELD_REQUEST_SIZE |
-                              UCP_PARAM_FIELD_REQUEST_INIT;
-    ucp_params.features     = UCP_FEATURE_TAG;
-    if (ucp_test_mode == TEST_MODE_WAIT || ucp_test_mode == TEST_MODE_EVENTFD) {
-        ucp_params.features |= UCP_FEATURE_WAKEUP;
-    }
-    ucp_params.request_size    = sizeof(struct ucx_context);
-    ucp_params.request_init    = request_init;
+    // ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
+    //                           UCP_PARAM_FIELD_REQUEST_SIZE |
+    //                           UCP_PARAM_FIELD_REQUEST_INIT;
+    // ucp_params.features     = UCP_FEATURE_TAG;
+    // if (ucp_wakeup_mode == WAKEUP_MODE_WAIT || ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
+    //     ucp_params.features |= UCP_FEATURE_WAKEUP;
+    // }
+    // ucp_params.request_size    = sizeof(struct ucp_request_context);
+    // ucp_params.request_init    = request_init;
 
-    status = ucp_init(&ucp_params, config, &ucp_context);
+    // status = ucp_init(&ucp_params, config, &ucp_context);
 
-    ucp_config_print(config, stdout, NULL, UCS_CONFIG_PRINT_CONFIG);
+    // ucp_config_print(config, stdout, NULL, UCS_CONFIG_PRINT_CONFIG);
 
-    ucp_config_release(config);
-    CHKERR_JUMP(status != UCS_OK, "ucp_init\n", err);
+    // ucp_config_release(config);
+    // CHKERR_JUMP(status != UCS_OK, "ucp_init\n", err);
+    status = createUcpContext(ucp_context);
+    CHKERR_JUMP(status != UCS_OK, "createUcpContext\n", err);
 
-    worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
+    // worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
+    // worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
 
-    status = ucp_worker_create(ucp_context, &worker_params, &ucp_worker);
+    // status = ucp_worker_create(ucp_context, &worker_params, &ucp_worker);
+    // CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
+    createUcpWorker(ucp_context, ucp_worker);
     CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
 
-    status = ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_len);
-    CHKERR_JUMP(status != UCS_OK, "ucp_worker_get_address\n", err_worker);
-
-    printf("[0x%x] local address length: %lu\n",
-           (unsigned int)pthread_self(), local_addr_len);
-
+    if(ucp_connect_mode != CONNECT_MODE_LISTENER){
+        
+        CHKERR_JUMP(status != UCS_OK, "ucp_worker_get_address\n", err_worker);
+        printf("[0x%x] local address length: %lu\n",(unsigned int)pthread_self(), local_addr_len);
+    }
+    
     /* OOB connection establishment */
     if (client_target_name) {
         peer_addr_len = local_addr_len;
@@ -563,7 +629,33 @@ err:
     return ret;
 }
 
-ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
+//| 输出示例参数用法
+static void usage(){
+    fprintf(stderr, "Usage: ucp_hello_world [parameters]\n");
+    fprintf(stderr, "UCP hello world client/server example utility\n");
+    fprintf(stderr, "\nParameters are:\n");
+    fprintf(stderr, "  -w      Select wakeup mode to test "
+            "ucp wakeup functions\n    options: w(wait) | e(eventfd) | p(probe)\n");
+    fprintf(stderr, "  -e      Emulate unexpected failure on server side"
+            "and handle an error on client side with enabled "
+            "UCP_ERR_HANDLING_MODE_PEER\n");
+    fprintf(stderr, "  -n name Set node name or IP address "
+            "of the server (required for client and should be ignored "
+            "for server)\n");
+    fprintf(stderr, "  -p port Set alternative server port (default:13337)\n");
+    fprintf(stderr, "  -s size Set test string length (default:16)\n");
+    fprintf(stderr, "  -m <mem type>  memory type of messages\n");
+    fprintf(stderr, "                 host - system memory (default)\n");
+    if (check_mem_type_support(UCS_MEMORY_TYPE_CUDA)) {
+        fprintf(stderr, "                 cuda - NVIDIA GPU memory\n");
+    }
+    if (check_mem_type_support(UCS_MEMORY_TYPE_CUDA_MANAGED)) {
+        fprintf(stderr, "                 cuda-managed - NVIDIA GPU managed/unified memory\n");
+    }
+    fprintf(stderr, "\n");
+}
+
+static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
 {
     int c = 0, idx = 0;
     opterr = 0;
@@ -571,20 +663,35 @@ ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
     err_handling_opt.ucp_err_mode   = UCP_ERR_HANDLING_MODE_NONE;
     err_handling_opt.failure        = 0;
 
-    while ((c = getopt(argc, argv, "wfben:p:s:m:h")) != -1) {
+    while ((c = getopt(argc, argv, "ew:c:o:n:p:s:m:h")) != -1) {
         switch (c) {
-        case 'w':
-            ucp_test_mode = TEST_MODE_WAIT;
-            break;
-        case 'f':
-            ucp_test_mode = TEST_MODE_EVENTFD;
-            break;
-        case 'b':
-            ucp_test_mode = TEST_MODE_PROBE;
-            break;
         case 'e':
             err_handling_opt.ucp_err_mode   = UCP_ERR_HANDLING_MODE_PEER;
             err_handling_opt.failure        = 1;
+            break;
+        case 'w':
+            switch (optarg){
+                case 'w':ucp_wakeup_mode = WAKEUP_MODE_WAIT; break;
+                case 'e':ucp_wakeup_mode = WAKEUP_MODE_EVENTFD; break;
+                case 'p':ucp_wakeup_mode = WAKEUP_MODE_PROBE; break;
+                default:fprintf(stderr,"Unsupport wakeup mode!\n");return UCS_ERR_UNSUPPORTED;
+            }
+            break;
+        case 'c':
+            switch (optarg){
+                case 'a':ucp_connect_mode = CONNECT_MODE_ADDRESS; break;
+                case 'l':ucp_connect_mode = CONNECT_MODE_LISTENER; break;
+                default:fprintf(stderr,"Unsupport connect mode!\n");return UCS_ERR_UNSUPPORTED;
+            }
+            break;
+        case 'o':
+            switch (optarg){
+                case 't':ucp_communication_mode = COMMUNICATION_MODE_TAG; break;
+                case 'r':ucp_communication_mode = COMMUNICATION_MODE_RMA; break;
+                case 'a':ucp_communication_mode = COMMUNICATION_MODE_AM; break;
+                case 's':ucp_communication_mode = COMMUNICATION_MODE_STREAM; break;
+                default:fprintf(stderr,"Unsupport communication mode!\n");return UCS_ERR_UNSUPPORTED;
+            }
             break;
         case 'n':
             *server_name = optarg;
@@ -620,25 +727,12 @@ ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
             /* Fall through */
         case 'h':
         default:
-            fprintf(stderr, "Usage: ucp_hello_world [parameters]\n");
-            fprintf(stderr, "UCP hello world client/server example utility\n");
-            fprintf(stderr, "\nParameters are:\n");
-            fprintf(stderr, "  -w      Select test mode \"wait\" to test "
-                    "ucp_worker_wait function\n");
-            fprintf(stderr, "  -f      Select test mode \"event fd\" to test "
-                    "ucp_worker_get_efd function with later poll\n");
-            fprintf(stderr, "  -b      Select test mode \"busy polling\" to test "
-                    "ucp_tag_probe_nb and ucp_worker_progress (default)\n");
-            fprintf(stderr, "  -e      Emulate unexpected failure on server side"
-                    "and handle an error on client side with enabled "
-                    "UCP_ERR_HANDLING_MODE_PEER\n");
-            print_common_help();
-            fprintf(stderr, "\n");
+            usage();
             return UCS_ERR_UNSUPPORTED;
         }
     }
-    fprintf(stderr, "INFO: UCP_HELLO_WORLD mode = %d server = %s port = %d\n",
-            ucp_test_mode, *server_name, server_port);
+    fprintf(stderr, "INFO: UCP_HELLO_WORLD server = %s port = %d\n",
+            *server_name, server_port);
 
     for (idx = optind; idx < argc; idx++) {
         fprintf(stderr, "WARNING: Non-option argument %s\n", argv[idx]);
