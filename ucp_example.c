@@ -61,6 +61,11 @@ struct ucp_request_context {
     int             completed;
 };
 
+typedef struct ucp_connect_context {
+    volatile ucp_conn_request_h conn_request;
+    ucp_listener_h              listener;
+} ucp_connect_context_t;
+
 enum ucp_example_wakeup_mode_t {
     WAKEUP_MODE_PROBE,
     WAKEUP_MODE_WAIT,
@@ -94,9 +99,10 @@ static ucp_address_t *local_addr;
 static ucp_address_t *peer_addr;
 static size_t local_addr_len;
 static size_t peer_addr_len;
-static ucp_listener_h server_listener;
+//static ucp_listener_h server_listener;
+static ucp_connect_context_t conn_ctx;
 
-static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name);
+static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name, char **listen_name);
 
 static void set_msg_data_len(struct msg *msg, uint64_t data_len)
 {
@@ -139,6 +145,44 @@ static void recv_handler(void *request, ucs_status_t status,
     printf("[0x%x] receive handler called with status %d (%s), length %lu\n",
            (unsigned int)pthread_self(), status, ucs_status_string(status),
            info->length);
+}
+
+/**
+ * The callback on the server side which is invoked upon receiving a connection
+ * request from the client.
+ */
+static void server_conn_handle_cb(ucp_conn_request_h conn_request, void *arg)
+{
+    ucx_server_ctx_t *context = arg;
+    ucp_conn_request_attr_t attr;
+    char ip_str[IP_STRING_LEN];
+    char port_str[PORT_STRING_LEN];
+    ucs_status_t status;
+
+    attr.field_mask = UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR;
+    status = ucp_conn_request_query(conn_request, &attr);
+    if (status == UCS_OK) {
+        printf("Server received a connection request from client at address %s:%s\n",
+               sockaddr_get_ip_str(&attr.client_address, ip_str, sizeof(ip_str)),
+               sockaddr_get_port_str(&attr.client_address, port_str, sizeof(port_str)));
+    } else if (status != UCS_ERR_UNSUPPORTED) {
+        fprintf(stderr, "failed to query the connection request (%s)\n",
+                ucs_status_string(status));
+    }
+
+    if (context->conn_request == NULL) {
+        context->conn_request = conn_request;
+    } else {
+        /* The server is already handling a connection request from a client,
+         * reject this new one */
+        printf("Rejecting a connection request. "
+               "Only one client at a time is supported.\n");
+        status = ucp_listener_reject(context->listener, conn_request);
+        if (status != UCS_OK) {
+            fprintf(stderr, "server failed to reject a connection request: (%s)\n",
+                    ucs_status_string(status));
+        }
+    }
 }
 
 static void ucx_wait(ucp_worker_h ucp_worker, struct ucp_request_context *context)
@@ -510,6 +554,7 @@ ucs_status_t exchangeWorkerAddresses(ucp_worker_h& ucp_worker, const char* ip){
     //| 生成worker地址
     status = ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_len);
     if(status != UCS_OK){return status;}
+    fprintf(stdout, "[0x%x] local address length: %lu\n",(unsigned int)pthread_self(), local_addr_len);
     
     //| 建立带外连接并交换地址
     if (ip) {
@@ -561,8 +606,67 @@ ucs_status_t createUcpListener(ucp_worker_h& ucp_worker, const char* ip){
                                 UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
     params.sockaddr.addr      = (const struct sockaddr*)&listen_addr;
     params.sockaddr.addrlen   = sizeof(listen_addr);
+    params.conn_handler.cb    = server_conn_handle_cb;
+    params.conn_handler.arg   = conn_ctx;
 
+    status = ucp_listener_create(ucp_worker, &params, &(conn_ctx.listener));
+    if(status != UCS_OK) return status;
     
+    attr.field_mask = UCP_LISTENER_ATTR_FIELD_SOCKADDR;
+    status = ucp_listener_query(&(conn_ctx.listener), &attr);
+    if(status != UCS_OK) {
+        fprintf(stderr, "failed to query the listener (%s)\n", ucs_status_string(status));
+        ucp_listener_destroy(&(conn_ctx.listener));
+        return status;
+    }
+    fprintf(stderr, "server is listening on IP %s port %s\n",
+            sockaddr_get_ip_str(&attr.sockaddr, ip_str, IP_STRING_LEN),
+            sockaddr_get_port_str(&attr.sockaddr, port_str, PORT_STRING_LEN));
+    fprintf(stdout, "Waiting for connection...\n");
+    return UCS_OK;
+}
+
+ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const char* ip){
+    ucp_ep_params_t ep_params;
+    ucp_request_param_t send_param;
+    ucp_request_context ctx;
+    ucs_status_ptr_t request;
+
+    ucs_status_t status;
+    if(ip == NULL){
+        // server
+        if(ucp_connect_mode != CONNECT_MODE_LISTENER){
+            // address
+            
+        }else{
+            // listener
+        }
+    }else{
+        // client
+        if(ucp_connect_mode != CONNECT_MODE_LISTENER){
+            // address 
+
+            //| 创建ep建立连接
+            ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+                                        UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
+            ep_params.address         = peer_addr;
+            ep_params.err_mode        = err_handling_opt.ucp_err_mode;
+
+            status = ucp_ep_create(ucp_worker, &ep_params, &ep);
+            if(status != UCS_OK) return status;
+
+            //| 发送地址以供server建立连接
+            ctx.completed = 0;
+            send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                                      UCP_OP_ATTR_FIELD_USER_DATA;
+            send_param.cb.send      = send_handler;
+            send_param.user_data    = &ctx;
+            request = ucp_tag_send_nbx(ep, )
+            
+        }else{
+            // listener
+        }
+    }
 }
 
 
@@ -581,6 +685,7 @@ int main(int argc, char **argv)
     /* OOB connection vars */
     uint64_t addr_len = 0;
     char *client_target_name = NULL;
+    char *server_listen_name = NULL;
     int oob_sock = -1;
     int ret = -1;
 
@@ -619,14 +724,18 @@ int main(int argc, char **argv)
 
     // status = ucp_worker_create(ucp_context, &worker_params, &ucp_worker);
     // CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
-    createUcpWorker(ucp_context, ucp_worker);
+    status = createUcpWorker(ucp_context, ucp_worker);
     CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
 
     if(ucp_connect_mode != CONNECT_MODE_LISTENER){
-        exchangeWorkerAddresses(ucp_worker, client_target_name);
+        status = exchangeWorkerAddresses(ucp_worker, client_target_name);
         CHKERR_JUMP(status != UCS_OK, "ucp_worker_get_address\n", err_worker);
-        printf("[0x%x] local address length: %lu\n",(unsigned int)pthread_self(), local_addr_len);
+    }else if(client_target_name == NULL){
+        status = createUcpListener(ucp_worker, server_listen_name);
+        CHKERR_JUMP(status != UCS_OK, "ucp_worker_create_listener\n", err_worker);
     }
+
+
     
     // /* OOB connection establishment */
     // if (client_target_name) {
@@ -668,11 +777,11 @@ int main(int argc, char **argv)
     }
     close(oob_sock);
 
-err_peer_addr:
-    free(peer_addr);
+// err_peer_addr:
+//     free(peer_addr);
 
-err_addr:
-    ucp_worker_release_address(ucp_worker, local_addr);
+// err_addr:
+//     ucp_worker_release_address(ucp_worker, local_addr);
 
 err_worker:
     ucp_worker_destroy(ucp_worker);
@@ -691,12 +800,19 @@ static void usage(){
     fprintf(stderr, "\nParameters are:\n");
     fprintf(stderr, "  -w      Select wakeup mode to test "
             "ucp wakeup functions\n    options: w(wait) | e(eventfd) | p(probe)\n");
+    fprintf(stderr, "  -c      Select connect mode to test "
+            "ucp connect functions\n    options: a(address) | l(listener)\n");
+    fprintf(stderr, "  -o      Select communication semantic to test "
+            "ucp communication functions\n    options: t(Tag Matching) | r(RMA) | a(Active Message) | s(Stream)\n");
     fprintf(stderr, "  -e      Emulate unexpected failure on server side"
             "and handle an error on client side with enabled "
             "UCP_ERR_HANDLING_MODE_PEER\n");
     fprintf(stderr, "  -n name Set node name or IP address "
             "of the server (required for client and should be ignored "
             "for server)\n");
+    fprintf(stderr, "  -l Set IP address where server listens "
+                    "(when the mode of connecting(c) is listener(l). If not specified, server uses INADDR_ANY; "
+                    "Irrelevant at client)\n");
     fprintf(stderr, "  -p port Set alternative server port (default:13337)\n");
     fprintf(stderr, "  -s size Set test string length (default:16)\n");
     fprintf(stderr, "  -m <mem type>  memory type of messages\n");
@@ -710,7 +826,7 @@ static void usage(){
     fprintf(stderr, "\n");
 }
 
-static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
+static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name, char **listen_name)
 {
     int c = 0, idx = 0;
     opterr = 0;
@@ -718,7 +834,7 @@ static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
     err_handling_opt.ucp_err_mode   = UCP_ERR_HANDLING_MODE_NONE;
     err_handling_opt.failure        = 0;
 
-    while ((c = getopt(argc, argv, "ew:c:o:n:p:s:m:h")) != -1) {
+    while ((c = getopt(argc, argv, "ew:c:o:n:l:p:s:m:h")) != -1) {
         switch (c) {
         case 'e':
             err_handling_opt.ucp_err_mode   = UCP_ERR_HANDLING_MODE_PEER;
@@ -750,6 +866,9 @@ static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name)
             break;
         case 'n':
             *server_name = optarg;
+            break;
+        case 'l':
+            *listen_name = optarg;
             break;
         case 'p':
             server_port = atoi(optarg);
