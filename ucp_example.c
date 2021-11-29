@@ -92,9 +92,9 @@ static const ucp_tag_t tag  = 0x1337a880u;
 static const ucp_tag_t tag_mask = UINT64_MAX;
 static ucp_address_t *local_addr;
 static ucp_address_t *peer_addr;
-
 static size_t local_addr_len;
 static size_t peer_addr_len;
+static ucp_listener_h server_listener;
 
 static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name);
 
@@ -503,10 +503,65 @@ ucs_status_t createUcpWorker(ucp_context_h& ucp_context, ucp_worker_h& ucp_worke
     return status;
 }
 
-ucs_status_t exchangeWorkerAddresses(ucp_worker_h& ucp_worker){
+ucs_status_t exchangeWorkerAddresses(ucp_worker_h& ucp_worker, const char* ip){
     ucs_status_t status;
+    int ret = -1;
+    uint64_t addr_len = 0;
+    //| 生成worker地址
     status = ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_len);
     if(status != UCS_OK){return status;}
+    
+    //| 建立带外连接并交换地址
+    if (ip) {
+        oob_sock = client_connect(client_target_name, server_port);
+        CHKERR_JUMP(oob_sock < 0, "client_connect\n", err_addr);
+
+        ret = recv(oob_sock, &addr_len, sizeof(addr_len), MSG_WAITALL);
+        CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len), "receive address length\n", err_addr, ret);
+
+        peer_addr_len = addr_len;
+        peer_addr = malloc(peer_addr_len);
+        CHKERR_JUMP(!peer_addr, "allocate memory\n", err_addr);
+
+        ret = recv(oob_sock, peer_addr, peer_addr_len, MSG_WAITALL);
+        CHKERR_JUMP_RETVAL(ret != (int)peer_addr_len, "receive address\n", err_peer_addr, ret);
+    } else {
+        oob_sock = server_connect(server_port);
+        CHKERR_JUMP(oob_sock < 0, "server_connect\n", err_peer_addr);
+
+        addr_len = local_addr_len;
+        ret = send(oob_sock, &addr_len, sizeof(addr_len), 0);
+        CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len), "send address length\n", err_peer_addr, ret);
+
+        ret = send(oob_sock, local_addr, local_addr_len, 0);
+        CHKERR_JUMP_RETVAL(ret != (int)local_addr_len, "send address\n", err_peer_addr, ret);
+    }
+    return UCS_OK;
+
+err_peer_addr:
+    free(peer_addr);
+
+err_addr:
+    ucp_worker_release_address(ucp_worker, local_addr);
+    return UCS_ERR_UNSUPPORTED;
+}
+
+ucs_status_t createUcpListener(ucp_worker_h& ucp_worker, const char* ip){
+    ucp_listener_params_t params;
+    ucp_listener_attr_t attr;
+    ucs_status_t status;
+    struct sockaddr_in listen_addr;
+
+    memset(listen_addr, 0, sizeof(struct sockaddr_in));
+    listen_addr->sin_family      = AF_INET;
+    listen_addr->sin_addr.s_addr = (ip) ? inet_addr(ip) : INADDR_ANY;
+    listen_addr->sin_port        = htons(server_port);
+
+    params.field_mask         = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
+                                UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
+    params.sockaddr.addr      = (const struct sockaddr*)&listen_addr;
+    params.sockaddr.addrlen   = sizeof(listen_addr);
+
     
 }
 
@@ -568,42 +623,42 @@ int main(int argc, char **argv)
     CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
 
     if(ucp_connect_mode != CONNECT_MODE_LISTENER){
-        
+        exchangeWorkerAddresses(ucp_worker, client_target_name);
         CHKERR_JUMP(status != UCS_OK, "ucp_worker_get_address\n", err_worker);
         printf("[0x%x] local address length: %lu\n",(unsigned int)pthread_self(), local_addr_len);
     }
     
-    /* OOB connection establishment */
-    if (client_target_name) {
-        peer_addr_len = local_addr_len;
+    // /* OOB connection establishment */
+    // if (client_target_name) {
+    //     peer_addr_len = local_addr_len;
 
-        oob_sock = client_connect(client_target_name, server_port);
-        CHKERR_JUMP(oob_sock < 0, "client_connect\n", err_addr);
+    //     oob_sock = client_connect(client_target_name, server_port);
+    //     CHKERR_JUMP(oob_sock < 0, "client_connect\n", err_addr);
 
-        ret = recv(oob_sock, &addr_len, sizeof(addr_len), MSG_WAITALL);
-        CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
-                           "receive address length\n", err_addr, ret);
+    //     ret = recv(oob_sock, &addr_len, sizeof(addr_len), MSG_WAITALL);
+    //     CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
+    //                        "receive address length\n", err_addr, ret);
 
-        peer_addr_len = addr_len;
-        peer_addr = malloc(peer_addr_len);
-        CHKERR_JUMP(!peer_addr, "allocate memory\n", err_addr);
+    //     peer_addr_len = addr_len;
+    //     peer_addr = malloc(peer_addr_len);
+    //     CHKERR_JUMP(!peer_addr, "allocate memory\n", err_addr);
 
-        ret = recv(oob_sock, peer_addr, peer_addr_len, MSG_WAITALL);
-        CHKERR_JUMP_RETVAL(ret != (int)peer_addr_len,
-                           "receive address\n", err_peer_addr, ret);
-    } else {
-        oob_sock = server_connect(server_port);
-        CHKERR_JUMP(oob_sock < 0, "server_connect\n", err_peer_addr);
+    //     ret = recv(oob_sock, peer_addr, peer_addr_len, MSG_WAITALL);
+    //     CHKERR_JUMP_RETVAL(ret != (int)peer_addr_len,
+    //                        "receive address\n", err_peer_addr, ret);
+    // } else {
+    //     oob_sock = server_connect(server_port);
+    //     CHKERR_JUMP(oob_sock < 0, "server_connect\n", err_peer_addr);
 
-        addr_len = local_addr_len;
-        ret = send(oob_sock, &addr_len, sizeof(addr_len), 0);
-        CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
-                           "send address length\n", err_peer_addr, ret);
+    //     addr_len = local_addr_len;
+    //     ret = send(oob_sock, &addr_len, sizeof(addr_len), 0);
+    //     CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
+    //                        "send address length\n", err_peer_addr, ret);
 
-        ret = send(oob_sock, local_addr, local_addr_len, 0);
-        CHKERR_JUMP_RETVAL(ret != (int)local_addr_len, "send address\n",
-                           err_peer_addr, ret);
-    }
+    //     ret = send(oob_sock, local_addr, local_addr_len, 0);
+    //     CHKERR_JUMP_RETVAL(ret != (int)local_addr_len, "send address\n",
+    //                        err_peer_addr, ret);
+    // }
 
     ret = run_test(client_target_name, ucp_worker);
 
