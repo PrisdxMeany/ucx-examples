@@ -632,6 +632,9 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
     ucp_request_context ctx;
     ucs_status_ptr_t request;
 
+    void* buf = NULL;
+    size_t buf_len = 0;
+
     ucs_status_t status;
     if(ip == NULL){
         // server
@@ -645,6 +648,13 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
         // client
         if(ucp_connect_mode != CONNECT_MODE_LISTENER){
             // address 
+            //| 存储地址信息
+            buf_len = sizeof(local_addr) + sizeof(local_addr_len);
+            buf = malloc(buf_len);
+            memset(buf, 0, buf_len);
+            if(buf == NULL) {return UCS_ERR_UNSUPPORTED;}
+            memcpy(buf, local_addr_len, sizeof(local_addr_len));
+            memcpy(buf+sizeof(local_addr_len), local_addr, local_addr_len);
 
             //| 创建ep建立连接
             ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
@@ -661,8 +671,17 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
                                       UCP_OP_ATTR_FIELD_USER_DATA;
             send_param.cb.send      = send_handler;
             send_param.user_data    = &ctx;
-            request = ucp_tag_send_nbx(ep, )
-            
+            request = ucp_tag_send_nbx(ep, buf, buf_len, tag, &send_param);
+
+            if (UCS_PTR_IS_ERR(request)){
+                fprintf(stderr, "unable to send UCX address message\n");
+                free(msg);
+                ucp_ep_destroy(ep);
+            }else if(UCS_PTR_IS_PTR(request)){
+                //todo 改写ucx_wait
+                ucx_wait(ucp_worker, &ctx);
+                ucp_request_release(request);
+            }
         }else{
             // listener
         }
