@@ -52,6 +52,7 @@
 #include <errno.h>   /* errno */
 #include <time.h>
 #include <signal.h>  /* raise */
+#include <arpa/inet.h>
 
 struct msg {
     uint64_t        data_len;
@@ -101,6 +102,7 @@ static size_t local_addr_len;
 static size_t peer_addr_len;
 //static ucp_listener_h server_listener;
 static ucp_connect_context_t conn_ctx;
+static int oob_sock;
 
 static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name, char **listen_name);
 
@@ -117,7 +119,7 @@ static void request_init(void *request)
 
 static void send_handler(void *request, ucs_status_t status, void *ctx)
 {
-    struct ucp_request_context *context = (struct ucp_request_context *) ctx;
+    struct ucp_request_context *context = ctx;
 
     context->completed = 1;
 
@@ -135,16 +137,13 @@ static void failure_handler(void *arg, ucp_ep_h ep, ucs_status_t status)
     *arg_status = status;
 }
 
-static void recv_handler(void *request, ucs_status_t status,
-                        ucp_tag_recv_info_t *info)
+static void recv_handler(void *request, ucs_status_t status, const ucp_tag_recv_info_t *info, void *ctx)
 {
-    struct ucp_request_context *context = (struct ucp_request_context *) request;
+    struct ucp_request_context *context = ctx;
 
     context->completed = 1;
 
-    printf("[0x%x] receive handler called with status %d (%s), length %lu\n",
-           (unsigned int)pthread_self(), status, ucs_status_string(status),
-           info->length);
+    printf("[0x%x] receive handler called with status %d (%s), length %lu\n", (unsigned int)pthread_self(), status, ucs_status_string(status), info->length);
 }
 
 /**
@@ -631,6 +630,9 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
     ucp_request_param_t send_param;
     ucp_request_context ctx;
     ucs_status_ptr_t request;
+    ucp_tag_message_h msg_tag;
+    ucp_tag_recv_info_t info_tag;
+    struct sockaddr_in connect_addr;
 
     void* buf = NULL;
     size_t buf_len = 0;
@@ -640,9 +642,66 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
         // server
         if(ucp_connect_mode != CONNECT_MODE_LISTENER){
             // address
+            //| 接收client的地址
+            do{
+                ucp_worker_progress(ucp_worker);
+                msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
+            }while(msg_tag == NULL);
             
+            buf = malloc(info_tag.length);
+            if(buf == NULL) return UCS_ERR_UNSUPPORTED;
+
+            request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length, ucp_dt_make_contig(1), msg_tag, recv_handler);
+
+            if (UCS_PTR_IS_ERR(request)) {
+                fprintf(stderr, "unable to receive UCX address message (%s)\n",ucs_status_string(UCS_PTR_STATUS(request)));
+                free(buf);
+                return UCS_ERR_UNSUPPORTED;
+            } else {
+                /* ucp_tag_msg_recv_nb() cannot return NULL */
+                assert(UCS_PTR_IS_PTR(request));
+                ucx_wait(ucp_worker, request);
+                request->completed = 0;
+                ucp_request_release(request);
+                printf("UCX address message was received\n");
+            }
+
+            //| 创建ep建立连接
+            memcpy(&peer_addr_len, buf, sizeof(peer_addr_len));
+            peer_addr = malloc(peer_addr_len);
+            if(peer_addr == NULL){
+                free(buf);
+                return UCS_ERR_UNSUPPORTED;
+            }
+            memcpy(peer_addr, buf+sizeof(peer_addr_len), peer_addr_len);
+            free(buf);
+
+            ep_params.field_mask    = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+                                    = UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+                                    = UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                    = UCP_EP_PARAM_FIELD_USER_DATA;
+            ep_params.address       = peer_addr;
+            ep_params.err_mode      = err_handling_opt.ucp_err_mode;
+            ep_params.err_handler.cb= failure_handler;
+            ep_params.err_handler.arg=NULL;
+            ep_params.user_data     = &client_status;
+
+            status = ucp_ep_create(ucp_worker, &ep_params, &ep);
+            if(status != UCS_OK) return status;
+
         }else{
             // listener
+            //| 监听连接
+            while (conn_ctx.conn_request == NULL) {
+                ucp_worker_progress(ucp_worker);
+            }
+
+                /* Server creates an ep to the client on the data worker.
+                * This is not the worker the listener was created on.
+                * The client side should have initiated the connection, leading
+                * to this ep's creation */
+            status = server_create_ep(ucp_worker, conn_ctx.conn_request, &ep);
+            if (status != UCS_OK) return status;
         }
     }else{
         // client
@@ -684,8 +743,61 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
             }
         }else{
             // listener
+            //| 设置连接地址
+            memset(connect_addr, 0, sizeof(struct sockaddr_in));
+            connect_addr->sin_family      = AF_INET;
+            connect_addr->sin_addr.s_addr = inet_addr(ip);
+            connect_addr->sin_port        = htons(server_port);
+
+            ep_params.field_mask       = UCP_EP_PARAM_FIELD_FLAGS       |
+                                         UCP_EP_PARAM_FIELD_SOCK_ADDR   |
+                                         UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                         UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
+            ep_params.err_mode         = UCP_ERR_HANDLING_MODE_PEER;
+            ep_params.err_handler.cb   = failure_handler;
+            ep_params.err_handler.arg  = NULL;
+            ep_params.flags            = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
+            ep_params.sockaddr.addr    = (struct sockaddr*)&connect_addr;
+            ep_params.sockaddr.addrlen = sizeof(connect_addr);
+
+            status = ucp_ep_create(ucp_worker, &ep_params, &ep);
+            if(status != UCS_OK) return status;
         }
     }
+}
+
+ucs_status_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, bool is_send = true){
+    ucp_request_param_t req_param;
+    ucs_status_ptr_t request;
+    struct ucp_request_context ctx;
+
+    ctx.completed = 0;
+    req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                             UCP_OP_ATTR_FIELD_USER_DATA;
+    req_param.user_data    = &ctx;
+
+    if(is_send){
+        req_param.cb.send = send_handler;
+        request = ucp_tag_send_nbx(ep, buf, buf_size, tag, &req_param);
+    }else{
+        req_param.cb.recv = recv_handler;
+        request = ucp_tag_recv_nbx(ucp_worker, buf, buf_size, tag, 0, &req_param);
+    }
+
+    if(request == NULL){
+        return UCS_OK;
+    }
+
+    //| 等待请求完成
+    ucs_status_t status;
+    if(UCS_PTR_IS_ERR(request)) {
+        return UCS_PTR_STATUS(request);
+    }
+    while(ctx.completed == 0){
+        ucp_worker_progress(ucp_worker);
+    }
+    status = ucp_request_check_status(request); 
+    return status;
 }
 
 
@@ -700,12 +812,12 @@ int main(int argc, char **argv)
     /* UCP handler objects */
     ucp_context_h ucp_context;
     ucp_worker_h ucp_worker;
+    ucp_ep_h ep;
 
     /* OOB connection vars */
     uint64_t addr_len = 0;
     char *client_target_name = NULL;
     char *server_listen_name = NULL;
-    int oob_sock = -1;
     int ret = -1;
 
     // memset(&ucp_params, 0, sizeof(ucp_params));
