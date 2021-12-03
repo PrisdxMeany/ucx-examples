@@ -147,6 +147,33 @@ static void recv_handler(void *request, ucs_status_t status, const ucp_tag_recv_
 }
 
 /**
+ * Close the given endpoint.
+ * Currently closing the endpoint with UCP_EP_CLOSE_MODE_FORCE since we currently
+ * cannot rely on the client side to be present during the server's endpoint
+ * closing process.
+ */
+static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
+{
+    ucp_request_param_t param;
+    ucs_status_t status;
+    void *close_req;
+
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
+    param.flags        = UCP_EP_CLOSE_FLAG_FORCE;
+    close_req          = ucp_ep_close_nbx(ep, &param);
+    if (UCS_PTR_IS_PTR(close_req)) {
+        do {
+            ucp_worker_progress(ucp_worker);
+            status = ucp_request_check_status(close_req);
+        } while (status == UCS_INPROGRESS);
+
+        ucp_request_free(close_req);
+    } else if (UCS_PTR_STATUS(close_req) != UCS_OK) {
+        fprintf(stderr, "failed to close ep %p\n", (void*)ep);
+    }
+}
+
+/**
  * The callback on the server side which is invoked upon receiving a connection
  * request from the client.
  */
@@ -766,10 +793,9 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
     }
 }
 
-ucs_status_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, bool is_send = true){
+ucs_status_ptr_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
     ucp_request_param_t req_param;
     ucs_status_ptr_t request;
-    struct ucp_request_context ctx;
 
     ctx.completed = 0;
     req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
@@ -784,6 +810,41 @@ ucs_status_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size
         request = ucp_tag_recv_nbx(ucp_worker, buf, buf_size, tag, 0, &req_param);
     }
 
+    return request;
+}
+
+ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
+    fprintf(stderr, "Can't support UCP-RMA mode!\n");
+    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+}
+
+ucs_status_ptr_t send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
+    fprintf(stderr, "Can't support UCP-AM mode!\n");
+    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+}
+
+ucs_status_ptr_t send_recv_stream(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
+    fprintf(stderr, "Can't support UCP-Stream mode!\n");
+    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    
+}
+
+ucs_status_t send_recv(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, bool is_send = true){
+    ucs_status_ptr_t request;
+    struct ucp_request_context ctx;
+    switch(ucp_communication_mode){
+        case COMMUNICATION_MODE_STREAM:
+            request = send_recv_stream(ucp_worker, ep, buf, buf_size, ctx, is_send);
+            break;
+        case COMMUNICATION_MODE_RMA:
+            request = send_recv_rma(ucp_worker, ep, buf, buf_size, ctx, is_send);
+            break;
+        case COMMUNICATION_MODE_AM:
+            request = send_recv_am(ucp_worker, ep, buf, buf_size, ctx, is_send);
+            break;
+        case COMMUNICATION_MODE_TAG:
+        default:request = send_recv_tag(ucp_worker, ep, buf, buf_size, ctx, is_send);
+    }
     if(request == NULL){
         return UCS_OK;
     }
@@ -799,6 +860,32 @@ ucs_status_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size
     status = ucp_request_check_status(request); 
     return status;
 }
+
+
+ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, size_t data_counts, bool is_server){
+    float* data = NULL;
+    ucs_status_t status;
+    data = new float(data_counts);
+    if(is_server){
+        for(int i=0;i<data_counts;i++){
+            data[i] = 1.1 + (i%2 == 0?i:i*(-1));
+        }
+    }
+    
+    if(is_server){
+        status = send_recv(ucp_worker, ep, data, sizeof(float)*data_counts, true);
+    }else{
+        status = send_recv(ucp_worker, ep, data, sizeof(float)*data_counts, false);
+    }
+    if(status != UCS_OK) return status;
+
+    fprint(stdout, is_server?"[Server]":"[Client]");
+    for(int i=0;i<data_counts;i++){
+        fprintf(stdout, "%f", data[i]);
+    }
+    return UCS_OK;
+}
+
 
 
 int main(int argc, char **argv)
@@ -900,7 +987,13 @@ int main(int argc, char **argv)
     //                        err_peer_addr, ret);
     // }
 
-    ret = run_test(client_target_name, ucp_worker);
+    //ret = run_test(client_target_name, ucp_worker);
+
+    status = establishConnection(ucp_worker, ep, client_target_name);
+    CHKERR_JUMP(status != UCS_OK, "establish connection\n", err_worker);
+
+    status = communication(ucp_worker, ep, 10, client_target_name==NULL?false:true);
+    CHKERR_JUMP(status != UCS_OK, "communication\n", err_ep);
 
     if (!ret && !err_handling_opt.failure) {
         /* Make sure remote is disconnected before destroying local worker */
@@ -913,6 +1006,9 @@ int main(int argc, char **argv)
 
 // err_addr:
 //     ucp_worker_release_address(ucp_worker, local_addr);
+
+err_ep:
+   ep_close(ucp_worker, ep); 
 
 err_worker:
     ucp_worker_destroy(ucp_worker);
