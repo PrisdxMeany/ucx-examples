@@ -680,7 +680,6 @@ ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
     // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
     ucp_request_param_t req_param;
     ucs_status_ptr_t request;
-    size_t recv_size;
 
     req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                              UCP_OP_ATTR_FIELD_USER_DATA;
@@ -696,8 +695,27 @@ ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
 }
 
 ucs_status_ptr_t send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
-    fprintf(stderr, "Can't support UCP-AM mode!\n");
-    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    // fprintf(stderr, "Can't support UCP-AM mode!\n");
+    // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    ucp_request_param_t req_param;
+    ucs_status_ptr_t request;
+    ucp_atomic_op_t opcode = UCP_ATOMIC_OP_ADD;
+    
+    req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                             UCP_OP_ATTR_FIELD_DATATYPE |
+                             UCP_OP_ATTR_FIELD_USER_DATA;
+    req_param.user_data    = &ctx;
+    req_param.datatype     = ucp_dt_make_contig(4);
+    req_param.cb.send = send_handler;
+
+    if(is_send){
+        request = ucp_atomic_op_nbx(ep, opcode, buf, buf_size/sizeof(float), rma_ctx.raddr, rma_ctx.rkey, &req_param);
+    }else{
+        opcode = UCP_ATOMIC_OP_AND;
+        request = ucp_atomic_op_nbx(ep, opcode, buf, buf_size/sizeof(float), rma_ctx.raddr, rma_ctx.rkey, &req_param);
+    }
+
+    return request;
 }
 
 ucs_status_ptr_t send_recv_stream(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
@@ -887,7 +905,7 @@ int main(int argc, char **argv)
 
     fprintf(stdout, "UCP context created!\n");
 
-    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         rma_buf = malloc(rma_buf_size);
         status = registAndPackRemoteAccessMemory(ucp_context, memh, rma_buf, rma_buf_size, rkey_buf, rkey_buf_size);
     }
@@ -912,7 +930,7 @@ int main(int argc, char **argv)
 
     fprintf(stdout, "UCP connect established!\n");
 
-    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         status = transferRemoteMemoryHandle(ucp_worker, ep, rma_buf, rkey_buf, rkey_buf_size);
         CHKERR_JUMP(status != UCS_OK, "transfer remote memory handle\n", err_rma);
     }
@@ -937,7 +955,7 @@ int main(int argc, char **argv)
     CHKERR_JUMP(status != UCS_OK, "flush ep\n", err_worker);
 
 err_rma:
-    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         releaseRemoteAccessMemory(ucp_context, memh, rkey_buf);
     }
     free(rma_buf);
