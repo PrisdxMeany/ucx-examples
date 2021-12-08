@@ -54,6 +54,10 @@
 #include <signal.h>  /* raise */
 #include <arpa/inet.h>
 
+#define IP_STRING_LEN          50
+#define PORT_STRING_LEN        8
+
+
 struct msg {
     uint64_t        data_len;
 };
@@ -66,6 +70,11 @@ typedef struct ucp_connect_context {
     volatile ucp_conn_request_h conn_request;
     ucp_listener_h              listener;
 } ucp_connect_context_t;
+
+struct ucp_rma_context {
+    uint64_t raddr;
+    ucp_rkey_h rkey;
+}ucp_rma_context_t;
 
 enum ucp_example_wakeup_mode_t {
     WAKEUP_MODE_PROBE,
@@ -101,15 +110,16 @@ static ucp_address_t *peer_addr;
 static size_t local_addr_len;
 static size_t peer_addr_len;
 //static ucp_listener_h server_listener;
-static ucp_connect_context_t conn_ctx;
+ucp_connect_context_t conn_ctx;
+ucp_rma_context rma_ctx; 
 static int oob_sock;
 
 static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name, char **listen_name);
 
-static void set_msg_data_len(struct msg *msg, uint64_t data_len)
-{
-    mem_type_memcpy(&msg->data_len, &data_len, sizeof(data_len));
-}
+// static void set_msg_data_len(struct msg *msg, uint64_t data_len)
+// {
+//     mem_type_memcpy(&msg->data_len, &data_len, sizeof(data_len));
+// }
 
 static void request_init(void *request)
 {
@@ -137,13 +147,32 @@ static void failure_handler(void *arg, ucp_ep_h ep, ucs_status_t status)
     *arg_status = status;
 }
 
-static void recv_handler(void *request, ucs_status_t status, const ucp_tag_recv_info_t *info, void *ctx)
+static void recv_msg_handler(void *request, ucs_status_t status,
+                        ucp_tag_recv_info_t *info)
+{
+    struct ucp_request_context *context = (struct ucp_request_context *) request;
+
+    context->completed = 1;
+
+    printf("[0x%x] receive handler called with status %d (%s), length %lu\n",
+           (unsigned int)pthread_self(), status, ucs_status_string(status),
+           info->length);
+}
+
+static void tag_recv_handler(void *request, ucs_status_t status, const ucp_tag_recv_info_t *info, void *ctx)
 {
     struct ucp_request_context *context = ctx;
 
     context->completed = 1;
 
     printf("[0x%x] receive handler called with status %d (%s), length %lu\n", (unsigned int)pthread_self(), status, ucs_status_string(status), info->length);
+}
+
+static void stream_recv_handler(void *request, ucs_status_t status, size_t length, void *ctx)
+{
+    struct ucp_request_context *context = ctx;
+
+    context->completed = 1;
 }
 
 /**
@@ -156,11 +185,11 @@ static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
 {
     ucp_request_param_t param;
     ucs_status_t status;
-    void *close_req;
+    ucs_status_ptr_t close_req;
 
     param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
     param.flags        = UCP_EP_CLOSE_FLAG_FORCE;
-    close_req          = ucp_ep_close_nbx(ep, &param);
+    close_req = ucp_ep_close_nbx(ep, &param);
     if (UCS_PTR_IS_PTR(close_req)) {
         do {
             ucp_worker_progress(ucp_worker);
@@ -169,7 +198,7 @@ static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
 
         ucp_request_free(close_req);
     } else if (UCS_PTR_STATUS(close_req) != UCS_OK) {
-        fprintf(stderr, "failed to close ep %p\n", (void*)ep);
+        fprintf(stderr, "failed to close ep %p with status [%s]\n", (void*)ep, ucs_status_string(UCS_PTR_STATUS(close_req)));
     }
 }
 
@@ -177,9 +206,50 @@ static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
  * The callback on the server side which is invoked upon receiving a connection
  * request from the client.
  */
+
+static char* sockaddr_get_ip_str(const struct sockaddr_storage *sock_addr,
+                                 char *ip_str, size_t max_size)
+{
+    struct sockaddr_in  addr_in;
+    struct sockaddr_in6 addr_in6;
+
+    switch (sock_addr->ss_family) {
+    case AF_INET:
+        memcpy(&addr_in, sock_addr, sizeof(struct sockaddr_in));
+        inet_ntop(AF_INET, &addr_in.sin_addr, ip_str, max_size);
+        return ip_str;
+    case AF_INET6:
+        memcpy(&addr_in6, sock_addr, sizeof(struct sockaddr_in6));
+        inet_ntop(AF_INET6, &addr_in6.sin6_addr, ip_str, max_size);
+        return ip_str;
+    default:
+        return "Invalid address family";
+    }
+}
+
+static char* sockaddr_get_port_str(const struct sockaddr_storage *sock_addr,
+                                   char *port_str, size_t max_size)
+{
+    struct sockaddr_in  addr_in;
+    struct sockaddr_in6 addr_in6;
+
+    switch (sock_addr->ss_family) {
+    case AF_INET:
+        memcpy(&addr_in, sock_addr, sizeof(struct sockaddr_in));
+        snprintf(port_str, max_size, "%d", ntohs(addr_in.sin_port));
+        return port_str;
+    case AF_INET6:
+        memcpy(&addr_in6, sock_addr, sizeof(struct sockaddr_in6));
+        snprintf(port_str, max_size, "%d", ntohs(addr_in6.sin6_port));
+        return port_str;
+    default:
+        return "Invalid address family";
+    }
+}
+
 static void server_conn_handle_cb(ucp_conn_request_h conn_request, void *arg)
 {
-    ucx_server_ctx_t *context = arg;
+    ucp_connect_context_t *context = arg;
     ucp_conn_request_attr_t attr;
     char ip_str[IP_STRING_LEN];
     char port_str[PORT_STRING_LEN];
@@ -260,131 +330,131 @@ err:
     return ret;
 }
 
-static int run_ucx_client(ucp_worker_h ucp_worker)
-{
-    ucp_request_param_t send_param;
-    ucp_tag_recv_info_t info_tag;
-    ucp_tag_message_h msg_tag;
-    ucs_status_t status;
-    ucp_ep_h server_ep;
-    ucp_ep_params_t ep_params;
-    struct msg *msg = 0;
-    struct ucp_request_context *request;
-    struct ucp_request_context ctx;
-    size_t msg_len = 0;
-    int ret = -1;
-    char *str;
+// static int run_ucx_client(ucp_worker_h ucp_worker)
+// {
+//     ucp_request_param_t send_param;
+//     ucp_tag_recv_info_t info_tag;
+//     ucp_tag_message_h msg_tag;
+//     ucs_status_t status;
+//     ucp_ep_h server_ep;
+//     ucp_ep_params_t ep_params;
+//     struct msg *msg = 0;
+//     struct ucp_request_context *request;
+//     struct ucp_request_context ctx;
+//     size_t msg_len = 0;
+//     int ret = -1;
+//     char *str;
 
-    /* Send client UCX address to server */
-    ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
-                                UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
-    ep_params.address         = peer_addr;
-    ep_params.err_mode        = err_handling_opt.ucp_err_mode;
+//     /* Send client UCX address to server */
+//     ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+//                                 UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
+//     ep_params.address         = peer_addr;
+//     ep_params.err_mode        = err_handling_opt.ucp_err_mode;
 
-    status = ucp_ep_create(ucp_worker, &ep_params, &server_ep);
-    CHKERR_JUMP(status != UCS_OK, "ucp_ep_create\n", err);
+//     status = ucp_ep_create(ucp_worker, &ep_params, &server_ep);
+//     CHKERR_JUMP(status != UCS_OK, "ucp_ep_create\n", err);
 
-    msg_len = sizeof(*msg) + local_addr_len;
-    msg     = malloc(msg_len);
-    CHKERR_JUMP(msg == NULL, "allocate memory\n", err_ep);
-    memset(msg, 0, msg_len);
+//     msg_len = sizeof(*msg) + local_addr_len;
+//     msg     = malloc(msg_len);
+//     CHKERR_JUMP(msg == NULL, "allocate memory\n", err_ep);
+//     memset(msg, 0, msg_len);
 
-    msg->data_len = local_addr_len;
-    memcpy(msg + 1, local_addr, local_addr_len);
+//     msg->data_len = local_addr_len;
+//     memcpy(msg + 1, local_addr, local_addr_len);
 
-    send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                              UCP_OP_ATTR_FIELD_USER_DATA;
-    send_param.cb.send      = send_handler;
-    send_param.user_data    = &ctx;
-    ctx.completed           = 0;
-    request                 = ucp_tag_send_nbx(server_ep, msg, msg_len, tag,
-                                               &send_param);
-    if (UCS_PTR_IS_ERR(request)) {
-        fprintf(stderr, "unable to send UCX address message\n");
-        free(msg);
-        goto err_ep;
-    } else if (UCS_PTR_IS_PTR(request)) {
-        ucx_wait(ucp_worker, &ctx);
-        ucp_request_release(request);
-    }
+//     send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+//                               UCP_OP_ATTR_FIELD_USER_DATA;
+//     send_param.cb.send      = send_handler;
+//     send_param.user_data    = &ctx;
+//     ctx.completed           = 0;
+//     request                 = ucp_tag_send_nbx(server_ep, msg, msg_len, tag,
+//                                                &send_param);
+//     if (UCS_PTR_IS_ERR(request)) {
+//         fprintf(stderr, "unable to send UCX address message\n");
+//         free(msg);
+//         goto err_ep;
+//     } else if (UCS_PTR_IS_PTR(request)) {
+//         ucx_wait(ucp_worker, &ctx);
+//         ucp_request_release(request);
+//     }
 
-    free(msg);
+//     free(msg);
 
-    if (err_handling_opt.failure) {
-        fprintf(stderr, "Emulating unexpected failure on client side\n");
-        raise(SIGKILL);
-    }
+//     if (err_handling_opt.failure) {
+//         fprintf(stderr, "Emulating unexpected failure on client side\n");
+//         raise(SIGKILL);
+//     }
 
-    /* Receive test string from server */
-    for (;;) {
+//     /* Receive test string from server */
+//     for (;;) {
 
-        /* Probing incoming events in non-block mode */
-        msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
-        if (msg_tag != NULL) {
-            /* Message arrived */
-            break;
-        } else if (ucp_worker_progress(ucp_worker)) {
-            /* Some events were polled; try again without going to sleep */
-            continue;
-        }
+//         /* Probing incoming events in non-block mode */
+//         msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
+//         if (msg_tag != NULL) {
+//             /* Message arrived */
+//             break;
+//         } else if (ucp_worker_progress(ucp_worker)) {
+//             /* Some events were polled; try again without going to sleep */
+//             continue;
+//         }
 
-        /* If we got here, ucp_worker_progress() returned 0, so we can sleep.
-         * Following blocked methods used to polling internal file descriptor
-         * to make CPU idle and don't spin loop
-         */
-        if (ucp_wakeup_mode == WAKEUP_MODE_WAIT) {
-            /* Polling incoming events*/
-            status = ucp_worker_wait(ucp_worker);
-            CHKERR_JUMP(status != UCS_OK, "ucp_worker_wait\n", err_ep);
-        } else if (ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
-            status = test_poll_wait(ucp_worker);
-            CHKERR_JUMP(status != UCS_OK, "test_poll_wait\n", err_ep);
-        }
-    }
+//         /* If we got here, ucp_worker_progress() returned 0, so we can sleep.
+//          * Following blocked methods used to polling internal file descriptor
+//          * to make CPU idle and don't spin loop
+//          */
+//         if (ucp_wakeup_mode == WAKEUP_MODE_WAIT) {
+//             /* Polling incoming events*/
+//             status = ucp_worker_wait(ucp_worker);
+//             CHKERR_JUMP(status != UCS_OK, "ucp_worker_wait\n", err_ep);
+//         } else if (ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
+//             status = test_poll_wait(ucp_worker);
+//             CHKERR_JUMP(status != UCS_OK, "test_poll_wait\n", err_ep);
+//         }
+//     }
 
-    msg = mem_type_malloc(info_tag.length);
-    CHKERR_JUMP(msg == NULL, "allocate memory\n", err_ep);
+//     msg = mem_type_malloc(info_tag.length);
+//     CHKERR_JUMP(msg == NULL, "allocate memory\n", err_ep);
 
-    request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length,
-                                  ucp_dt_make_contig(1), msg_tag,
-                                  recv_handler);
+//     request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length,
+//                                   ucp_dt_make_contig(1), msg_tag,
+//                                   recv_handler);
 
-    if (UCS_PTR_IS_ERR(request)) {
-        fprintf(stderr, "unable to receive UCX data message (%u)\n",
-                UCS_PTR_STATUS(request));
-        free(msg);
-        goto err_ep;
-    } else {
-        /* ucp_tag_msg_recv_nb() cannot return NULL */
-        assert(UCS_PTR_IS_PTR(request));
-        ucx_wait(ucp_worker, request);
-        request->completed = 0;
-        ucp_request_release(request);
-        printf("UCX data message was received\n");
-    }
+//     if (UCS_PTR_IS_ERR(request)) {
+//         fprintf(stderr, "unable to receive UCX data message (%u)\n",
+//                 UCS_PTR_STATUS(request));
+//         free(msg);
+//         goto err_ep;
+//     } else {
+//         /* ucp_tag_msg_recv_nb() cannot return NULL */
+//         assert(UCS_PTR_IS_PTR(request));
+//         ucx_wait(ucp_worker, request);
+//         request->completed = 0;
+//         ucp_request_release(request);
+//         printf("UCX data message was received\n");
+//     }
 
-    str = calloc(1, test_string_length);
-    if (str != NULL) {
-        mem_type_memcpy(str, msg + 1, test_string_length);
-        printf("\n\n----- UCP TEST SUCCESS ----\n\n");
-        printf("%s", str);
-        printf("\n\n---------------------------\n\n");
-        free(str);
-    } else {
-        fprintf(stderr, "Memory allocation failed\n");
-        goto err_ep;
-    }
+//     str = calloc(1, test_string_length);
+//     if (str != NULL) {
+//         mem_type_memcpy(str, msg + 1, test_string_length);
+//         printf("\n\n----- UCP TEST SUCCESS ----\n\n");
+//         printf("%s", str);
+//         printf("\n\n---------------------------\n\n");
+//         free(str);
+//     } else {
+//         fprintf(stderr, "Memory allocation failed\n");
+//         goto err_ep;
+//     }
 
-    mem_type_free(msg);
+//     mem_type_free(msg);
 
-    ret = 0;
+//     ret = 0;
 
-err_ep:
-    ucp_ep_destroy(server_ep);
+// err_ep:
+//     ucp_ep_destroy(server_ep);
 
-err:
-    return ret;
-}
+// err:
+//     return ret;
+// }
 
 static void flush_callback(void *request, ucs_status_t status, void *user_data)
 {
@@ -413,124 +483,124 @@ static ucs_status_t flush_ep(ucp_worker_h worker, ucp_ep_h ep)
     }
 }
 
-static int run_ucx_server(ucp_worker_h ucp_worker)
-{
-    ucp_request_param_t send_param;
-    ucp_tag_recv_info_t info_tag;
-    ucp_tag_message_h msg_tag;
-    ucs_status_t status;
-    ucp_ep_h client_ep;
-    ucp_ep_params_t ep_params;
-    struct msg *msg = 0;
-    struct ucp_request_context *request = 0;
-    struct ucp_request_context ctx;
-    size_t msg_len = 0;
-    int ret;
+// static int run_ucx_server(ucp_worker_h ucp_worker)
+// {
+//     ucp_request_param_t send_param;
+//     ucp_tag_recv_info_t info_tag;
+//     ucp_tag_message_h msg_tag;
+//     ucs_status_t status;
+//     ucp_ep_h client_ep;
+//     ucp_ep_params_t ep_params;
+//     struct msg *msg = 0;
+//     struct ucp_request_context *request = 0;
+//     struct ucp_request_context ctx;
+//     size_t msg_len = 0;
+//     int ret;
 
-    /* Receive client UCX address */
-    do {
-        /* Progressing before probe to update the state */
-        ucp_worker_progress(ucp_worker);
+//     /* Receive client UCX address */
+//     do {
+//         /* Progressing before probe to update the state */
+//         ucp_worker_progress(ucp_worker);
 
-        /* Probing incoming events in non-block mode */
-        msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
-    } while (msg_tag == NULL);
+//         /* Probing incoming events in non-block mode */
+//         msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
+//     } while (msg_tag == NULL);
 
-    msg = malloc(info_tag.length);
-    CHKERR_ACTION(msg == NULL, "allocate memory\n", ret = -1; goto err);
-    request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length,
-                                  ucp_dt_make_contig(1), msg_tag, recv_handler);
+//     msg = malloc(info_tag.length);
+//     CHKERR_ACTION(msg == NULL, "allocate memory\n", ret = -1; goto err);
+//     request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length,
+//                                   ucp_dt_make_contig(1), msg_tag, recv_handler);
 
-    if (UCS_PTR_IS_ERR(request)) {
-        fprintf(stderr, "unable to receive UCX address message (%s)\n",
-                ucs_status_string(UCS_PTR_STATUS(request)));
-        free(msg);
-        ret = -1;
-        goto err;
-    } else {
-        /* ucp_tag_msg_recv_nb() cannot return NULL */
-        assert(UCS_PTR_IS_PTR(request));
-        ucx_wait(ucp_worker, request);
-        request->completed = 0;
-        ucp_request_release(request);
-        printf("UCX address message was received\n");
-    }
+//     if (UCS_PTR_IS_ERR(request)) {
+//         fprintf(stderr, "unable to receive UCX address message (%s)\n",
+//                 ucs_status_string(UCS_PTR_STATUS(request)));
+//         free(msg);
+//         ret = -1;
+//         goto err;
+//     } else {
+//         /* ucp_tag_msg_recv_nb() cannot return NULL */
+//         assert(UCS_PTR_IS_PTR(request));
+//         ucx_wait(ucp_worker, request);
+//         request->completed = 0;
+//         ucp_request_release(request);
+//         printf("UCX address message was received\n");
+//     }
 
-    peer_addr_len = msg->data_len;
-    peer_addr     = malloc(peer_addr_len);
-    if (peer_addr == NULL) {
-        fprintf(stderr, "unable to allocate memory for peer address\n");
-        free(msg);
-        ret = -1;
-        goto err;
-    }
+//     peer_addr_len = msg->data_len;
+//     peer_addr     = malloc(peer_addr_len);
+//     if (peer_addr == NULL) {
+//         fprintf(stderr, "unable to allocate memory for peer address\n");
+//         free(msg);
+//         ret = -1;
+//         goto err;
+//     }
 
-    memcpy(peer_addr, msg + 1, peer_addr_len);
+//     memcpy(peer_addr, msg + 1, peer_addr_len);
 
-    free(msg);
+//     free(msg);
 
-    /* Send test string to client */
-    ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
-                                UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
-                                UCP_EP_PARAM_FIELD_ERR_HANDLER |
-                                UCP_EP_PARAM_FIELD_USER_DATA;
-    ep_params.address         = peer_addr;
-    ep_params.err_mode        = err_handling_opt.ucp_err_mode;
-    ep_params.err_handler.cb  = failure_handler;
-    ep_params.err_handler.arg = NULL;
-    ep_params.user_data       = &client_status;
+//     /* Send test string to client */
+//     ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+//                                 UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+//                                 UCP_EP_PARAM_FIELD_ERR_HANDLER |
+//                                 UCP_EP_PARAM_FIELD_USER_DATA;
+//     ep_params.address         = peer_addr;
+//     ep_params.err_mode        = err_handling_opt.ucp_err_mode;
+//     ep_params.err_handler.cb  = failure_handler;
+//     ep_params.err_handler.arg = NULL;
+//     ep_params.user_data       = &client_status;
 
-    status = ucp_ep_create(ucp_worker, &ep_params, &client_ep);
-    CHKERR_ACTION(status != UCS_OK, "ucp_ep_create\n", ret = -1; goto err);
+//     status = ucp_ep_create(ucp_worker, &ep_params, &client_ep);
+//     CHKERR_ACTION(status != UCS_OK, "ucp_ep_create\n", ret = -1; goto err);
 
-    msg_len = sizeof(*msg) + test_string_length;
-    msg = mem_type_malloc(msg_len);
-    CHKERR_ACTION(msg == NULL, "allocate memory\n", ret = -1; goto err_ep);
-    mem_type_memset(msg, 0, msg_len);
+//     msg_len = sizeof(*msg) + test_string_length;
+//     msg = mem_type_malloc(msg_len);
+//     CHKERR_ACTION(msg == NULL, "allocate memory\n", ret = -1; goto err_ep);
+//     mem_type_memset(msg, 0, msg_len);
 
-    set_msg_data_len(msg, msg_len - sizeof(*msg));
-    ret = generate_test_string((char *)(msg + 1), test_string_length);
-    CHKERR_JUMP(ret < 0, "generate test string", err_free_mem_type_msg);
+//     set_msg_data_len(msg, msg_len - sizeof(*msg));
+//     ret = generate_test_string((char *)(msg + 1), test_string_length);
+//     CHKERR_JUMP(ret < 0, "generate test string", err_free_mem_type_msg);
 
-    send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                              UCP_OP_ATTR_FIELD_USER_DATA;
-    send_param.cb.send      = send_handler;
-    send_param.user_data    = &ctx;
-    ctx.completed           = 0;
-    request                 = ucp_tag_send_nbx(client_ep, msg, msg_len, tag,
-                                               &send_param);
-    if (UCS_PTR_IS_ERR(request)) {
-        fprintf(stderr, "unable to send UCX data message\n");
-        ret = -1;
-        goto err_free_mem_type_msg;
-    } else if (UCS_PTR_IS_PTR(request)) {
-        printf("UCX data message was scheduled for send\n");
-        ucx_wait(ucp_worker, &ctx);
-        ucp_request_release(request);
-    }
+//     send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+//                               UCP_OP_ATTR_FIELD_USER_DATA;
+//     send_param.cb.send      = send_handler;
+//     send_param.user_data    = &ctx;
+//     ctx.completed           = 0;
+//     request                 = ucp_tag_send_nbx(client_ep, msg, msg_len, tag,
+//                                                &send_param);
+//     if (UCS_PTR_IS_ERR(request)) {
+//         fprintf(stderr, "unable to send UCX data message\n");
+//         ret = -1;
+//         goto err_free_mem_type_msg;
+//     } else if (UCS_PTR_IS_PTR(request)) {
+//         printf("UCX data message was scheduled for send\n");
+//         ucx_wait(ucp_worker, &ctx);
+//         ucp_request_release(request);
+//     }
 
-    status = flush_ep(ucp_worker, client_ep);
-    printf("flush_ep completed with status %d (%s)\n",
-            status, ucs_status_string(status));
+//     status = flush_ep(ucp_worker, client_ep);
+//     printf("flush_ep completed with status %d (%s)\n",
+//             status, ucs_status_string(status));
 
-    ret = 0;
+//     ret = 0;
 
-err_free_mem_type_msg:
-    mem_type_free(msg);
-err_ep:
-    ucp_ep_destroy(client_ep);
-err:
-    return ret;
-}
+// err_free_mem_type_msg:
+//     mem_type_free(msg);
+// err_ep:
+//     ucp_ep_destroy(client_ep);
+// err:
+//     return ret;
+// }
 
-static int run_test(const char *client_target_name, ucp_worker_h ucp_worker)
-{
-    if (client_target_name != NULL) {
-        return run_ucx_client(ucp_worker);
-    } else {
-        return run_ucx_server(ucp_worker);
-    }
-}
+// static int run_test(const char *client_target_name, ucp_worker_h ucp_worker)
+// {
+//     if (client_target_name != NULL) {
+//         return run_ucx_client(ucp_worker);
+//     } else {
+//         return run_ucx_server(ucp_worker);
+//     }
+// }
 
 ucs_status_t createUcpContext(ucp_context_h& ucp_context){
     ucp_params_t ucp_params;
@@ -544,11 +614,11 @@ ucs_status_t createUcpContext(ucp_context_h& ucp_context){
     ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
                               UCP_PARAM_FIELD_REQUEST_SIZE |
                               UCP_PARAM_FIELD_REQUEST_INIT;
+    ucp_params.features     = UCP_FEATURE_TAG;
     switch(ucp_communication_mode){
-        case COMMUNICATION_MODE_RMA:ucp_params.features = UCP_FEATURE_RMA; break;
-        case COMMUNICATION_MODE_AM:ucp_params.features = UCP_FEATURE_AM; break;
-        case COMMUNICATION_MODE_STREAM:ucp_params.features = UCP_FEATURE_STREAM; break;
-        case COMMUNICATION_MODE_TAG:
+        case COMMUNICATION_MODE_RMA:ucp_params.features |= UCP_FEATURE_RMA; break;
+        case COMMUNICATION_MODE_AM:ucp_params.features |= UCP_FEATURE_AM; break;
+        case COMMUNICATION_MODE_STREAM:ucp_params.features |= UCP_FEATURE_STREAM; break;
         default:ucp_params.features = UCP_FEATURE_TAG;
     }
     if (ucp_wakeup_mode == WAKEUP_MODE_WAIT || ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
@@ -559,6 +629,25 @@ ucs_status_t createUcpContext(ucp_context_h& ucp_context){
 
     status = ucp_init(&ucp_params, config, &ucp_context);
     return status;
+}
+
+ucs_status_t registAndPackRemoteAccessMemory(ucp_context_h& ucp_context, ucp_mem_h& mem_handle, void* buf, size_t buf_size, void*& rkey_buf, size_t& rkey_buf_size){
+    ucp_mem_map_params_t mem_param;
+    ucs_status_t status;
+
+    //todo 研究下分配的FLAG
+    mem_param.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS |
+                           UCP_MEM_MAP_PARAM_FIELD_LENGTH;
+    mem_param.address    = buf;
+    mem_param.length     = buf_size;
+    
+    status = ucp_mem_map(ucp_context, &mem_param, &mem_handle);
+    if(status!=UCS_OK) return status;
+
+    status = ucp_rkey_pack(ucp_context, mem_handle, &rkey_buf, &rkey_buf_size);
+    if(status!=UCS_OK) return status;
+
+    return UCS_OK;
 }
 
 ucs_status_t createUcpWorker(ucp_context_h& ucp_context, ucp_worker_h& ucp_worker){
@@ -584,7 +673,7 @@ ucs_status_t exchangeWorkerAddresses(ucp_worker_h& ucp_worker, const char* ip){
     
     //| 建立带外连接并交换地址
     if (ip) {
-        oob_sock = client_connect(client_target_name, server_port);
+        oob_sock = client_connect(ip, server_port);
         CHKERR_JUMP(oob_sock < 0, "client_connect\n", err_addr);
 
         ret = recv(oob_sock, &addr_len, sizeof(addr_len), MSG_WAITALL);
@@ -622,27 +711,29 @@ ucs_status_t createUcpListener(ucp_worker_h& ucp_worker, const char* ip){
     ucp_listener_attr_t attr;
     ucs_status_t status;
     struct sockaddr_in listen_addr;
+    char ip_str[IP_STRING_LEN];
+    char port_str[PORT_STRING_LEN];
 
-    memset(listen_addr, 0, sizeof(struct sockaddr_in));
-    listen_addr->sin_family      = AF_INET;
-    listen_addr->sin_addr.s_addr = (ip) ? inet_addr(ip) : INADDR_ANY;
-    listen_addr->sin_port        = htons(server_port);
+    memset(&listen_addr, 0, sizeof(struct sockaddr_in));
+    listen_addr.sin_family      = AF_INET;
+    listen_addr.sin_addr.s_addr = (ip) ? inet_addr(ip) : INADDR_ANY;
+    listen_addr.sin_port        = htons(server_port);
 
     params.field_mask         = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
                                 UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
     params.sockaddr.addr      = (const struct sockaddr*)&listen_addr;
     params.sockaddr.addrlen   = sizeof(listen_addr);
     params.conn_handler.cb    = server_conn_handle_cb;
-    params.conn_handler.arg   = conn_ctx;
+    params.conn_handler.arg   = &conn_ctx;
 
     status = ucp_listener_create(ucp_worker, &params, &(conn_ctx.listener));
     if(status != UCS_OK) return status;
     
     attr.field_mask = UCP_LISTENER_ATTR_FIELD_SOCKADDR;
-    status = ucp_listener_query(&(conn_ctx.listener), &attr);
+    status = ucp_listener_query(conn_ctx.listener, &attr);
     if(status != UCS_OK) {
         fprintf(stderr, "failed to query the listener (%s)\n", ucs_status_string(status));
-        ucp_listener_destroy(&(conn_ctx.listener));
+        ucp_listener_destroy(conn_ctx.listener);
         return status;
     }
     fprintf(stderr, "server is listening on IP %s port %s\n",
@@ -652,7 +743,7 @@ ucs_status_t createUcpListener(ucp_worker_h& ucp_worker, const char* ip){
     return UCS_OK;
 }
 
-ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const char* ip){
+ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep, const char* ip){
     ucp_ep_params_t ep_params;
     ucp_request_param_t send_param;
     ucp_request_context ctx;
@@ -669,6 +760,7 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
         // server
         if(ucp_connect_mode != CONNECT_MODE_LISTENER){
             // address
+            fprintf(stdout, "waiting for client address...\n");
             //| 接收client的地址
             do{
                 ucp_worker_progress(ucp_worker);
@@ -678,7 +770,7 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
             buf = malloc(info_tag.length);
             if(buf == NULL) return UCS_ERR_UNSUPPORTED;
 
-            request = ucp_tag_msg_recv_nb(ucp_worker, msg, info_tag.length, ucp_dt_make_contig(1), msg_tag, recv_handler);
+            request = ucp_tag_msg_recv_nb(ucp_worker, buf, info_tag.length, ucp_dt_make_contig(1), msg_tag, recv_msg_handler);
 
             if (UCS_PTR_IS_ERR(request)) {
                 fprintf(stderr, "unable to receive UCX address message (%s)\n",ucs_status_string(UCS_PTR_STATUS(request)));
@@ -688,7 +780,7 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
                 /* ucp_tag_msg_recv_nb() cannot return NULL */
                 assert(UCS_PTR_IS_PTR(request));
                 ucx_wait(ucp_worker, request);
-                request->completed = 0;
+                ((struct ucp_request_context*)request)->completed = 0;
                 ucp_request_release(request);
                 printf("UCX address message was received\n");
             }
@@ -704,9 +796,9 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
             free(buf);
 
             ep_params.field_mask    = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
-                                    = UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
-                                    = UCP_EP_PARAM_FIELD_ERR_HANDLER |
-                                    = UCP_EP_PARAM_FIELD_USER_DATA;
+                                      UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+                                      UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                      UCP_EP_PARAM_FIELD_USER_DATA;
             ep_params.address       = peer_addr;
             ep_params.err_mode      = err_handling_opt.ucp_err_mode;
             ep_params.err_handler.cb= failure_handler;
@@ -718,29 +810,35 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
 
         }else{
             // listener
+            fprintf(stdout, "listening for client connecting...\n");
             //| 监听连接
             while (conn_ctx.conn_request == NULL) {
                 ucp_worker_progress(ucp_worker);
             }
 
-                /* Server creates an ep to the client on the data worker.
-                * This is not the worker the listener was created on.
-                * The client side should have initiated the connection, leading
-                * to this ep's creation */
-            status = server_create_ep(ucp_worker, conn_ctx.conn_request, &ep);
-            if (status != UCS_OK) return status;
+            ep_params.field_mask        = UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                          UCP_EP_PARAM_FIELD_CONN_REQUEST;
+            ep_params.conn_request      = conn_ctx.conn_request;
+            ep_params.err_handler.cb    = failure_handler;
+            ep_params.err_handler.arg   = NULL;
+
+            status = ucp_ep_create(ucp_worker, &ep_params, &ep);
+            if(status != UCS_OK) return status;
         }
     }else{
         // client
         if(ucp_connect_mode != CONNECT_MODE_LISTENER){
+            fprintf(stdout, "sending address to server...\n");
             // address 
             //| 存储地址信息
-            buf_len = sizeof(local_addr) + sizeof(local_addr_len);
+            buf_len = local_addr_len + sizeof(local_addr_len);
             buf = malloc(buf_len);
             memset(buf, 0, buf_len);
             if(buf == NULL) {return UCS_ERR_UNSUPPORTED;}
-            memcpy(buf, local_addr_len, sizeof(local_addr_len));
+            memcpy(buf, &local_addr_len, sizeof(local_addr_len));
             memcpy(buf+sizeof(local_addr_len), local_addr, local_addr_len);
+
+            fprintf(stdout, "local address composed!\n");
 
             //| 创建ep建立连接
             ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
@@ -759,22 +857,28 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
             send_param.user_data    = &ctx;
             request = ucp_tag_send_nbx(ep, buf, buf_len, tag, &send_param);
 
+            fprintf(stdout, "local address sent!\n");
+
             if (UCS_PTR_IS_ERR(request)){
                 fprintf(stderr, "unable to send UCX address message\n");
-                free(msg);
+                free(buf);
                 ucp_ep_destroy(ep);
             }else if(UCS_PTR_IS_PTR(request)){
                 //todo 改写ucx_wait
-                ucx_wait(ucp_worker, &ctx);
+                while(ctx.completed == 0){
+                    ucp_worker_progress(ucp_worker);
+                }
+                // ucx_wait(ucp_worker, &ctx);
                 ucp_request_release(request);
             }
         }else{
             // listener
+            fprintf(stdout, "connecting to server(%s)...\n", ip);
             //| 设置连接地址
-            memset(connect_addr, 0, sizeof(struct sockaddr_in));
-            connect_addr->sin_family      = AF_INET;
-            connect_addr->sin_addr.s_addr = inet_addr(ip);
-            connect_addr->sin_port        = htons(server_port);
+            memset(&connect_addr, 0, sizeof(struct sockaddr_in));
+            connect_addr.sin_family      = AF_INET;
+            connect_addr.sin_addr.s_addr = inet_addr(ip);
+            connect_addr.sin_port        = htons(server_port);
 
             ep_params.field_mask       = UCP_EP_PARAM_FIELD_FLAGS       |
                                          UCP_EP_PARAM_FIELD_SOCK_ADDR   |
@@ -791,13 +895,13 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep,const ch
             if(status != UCS_OK) return status;
         }
     }
+    return UCS_OK;
 }
 
 ucs_status_ptr_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
     ucp_request_param_t req_param;
     ucs_status_ptr_t request;
 
-    ctx.completed = 0;
     req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                              UCP_OP_ATTR_FIELD_USER_DATA;
     req_param.user_data    = &ctx;
@@ -806,7 +910,7 @@ ucs_status_ptr_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
         req_param.cb.send = send_handler;
         request = ucp_tag_send_nbx(ep, buf, buf_size, tag, &req_param);
     }else{
-        req_param.cb.recv = recv_handler;
+        req_param.cb.recv = tag_recv_handler;
         request = ucp_tag_recv_nbx(ucp_worker, buf, buf_size, tag, 0, &req_param);
     }
 
@@ -814,8 +918,23 @@ ucs_status_ptr_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
 }
 
 ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
-    fprintf(stderr, "Can't support UCP-RMA mode!\n");
-    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    // fprintf(stderr, "Can't support UCP-RMA mode!\n");
+    // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    ucp_request_param_t req_param;
+    ucs_status_ptr_t request;
+    size_t recv_size;
+
+    req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                             UCP_OP_ATTR_FIELD_USER_DATA;
+    req_param.user_data    = &ctx;
+    req_param.cb.send = send_handler;
+    if(is_send){
+        request = ucp_put_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
+    }else{
+        request = ucp_get_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
+    }
+
+    return request;
 }
 
 ucs_status_ptr_t send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
@@ -824,17 +943,43 @@ ucs_status_ptr_t send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, s
 }
 
 ucs_status_ptr_t send_recv_stream(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
-    fprintf(stderr, "Can't support UCP-Stream mode!\n");
-    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
-    
+    //fprintf(stderr, "Can't support UCP-Stream mode!\n");
+    //return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    ucp_request_param_t req_param;
+    ucs_status_ptr_t request;
+    size_t recv_size;
+
+    req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                             UCP_OP_ATTR_FIELD_USER_DATA;
+    req_param.user_data    = &ctx;
+
+    if(is_send){
+        req_param.cb.send = send_handler;
+        request = ucp_stream_send_nbx(ep, buf, buf_size, &req_param);
+    }else{
+        req_param.op_attr_mask  |= UCP_OP_ATTR_FIELD_FLAGS;
+        //req_param.cb.recv = recv_handler;
+        req_param.cb.recv_stream = stream_recv_handler;
+        request = ucp_stream_recv_nbx(ep, buf, buf_size, &recv_size, &req_param);
+        if(request==NULL){
+            fprintf(stdout, "Expecting receiving %d Bytes with %d actually!\n", buf_size, recv_size);
+            buf_size = recv_size;
+        }
+    }
+
+    return request;
 }
 
-ucs_status_t send_recv(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, bool is_send = true){
-    ucs_status_ptr_t request;
+ucs_status_t send_recv(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, bool is_send = true, ucp_example_communication_mode_t comm_mode = COMMUNICATION_MODE_TAG){
+    ucs_status_ptr_t request = NULL;
     struct ucp_request_context ctx;
-    switch(ucp_communication_mode){
+    //void (*release_request)(void*);
+    //release_request = ucp_request_release;
+    ctx.completed = 0;
+    switch(comm_mode){
         case COMMUNICATION_MODE_STREAM:
             request = send_recv_stream(ucp_worker, ep, buf, buf_size, ctx, is_send);
+            //release_request = ucp_request_free;
             break;
         case COMMUNICATION_MODE_RMA:
             request = send_recv_rma(ucp_worker, ep, buf, buf_size, ctx, is_send);
@@ -850,22 +995,76 @@ ucs_status_t send_recv(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& 
     }
 
     //| 等待请求完成
+    fprintf(stdout, "Waiting for request completed!\n");
     ucs_status_t status;
     if(UCS_PTR_IS_ERR(request)) {
+        fprintf(stdout, "Request is error!\n");
         return UCS_PTR_STATUS(request);
     }
+    fprintf(stdout, "Begin progress...\n");
     while(ctx.completed == 0){
         ucp_worker_progress(ucp_worker);
     }
-    status = ucp_request_check_status(request); 
+    fprintf(stdout, "Request progressed!\n");
+    status = ucp_request_check_status(request);
+    //(*release_request)(request);
+    ucp_request_free(request);
+    fprintf(stdout, "Realse request!\n");
+    return status;
+}
+
+ucs_status_t transferRemoteMemoryHandle(ucp_worker_h ucp_worker, ucp_ep_h ep, void* local_buf, void* rkey_buf, size_t rkey_buf_size){
+    ucs_status_t status;
+
+    size_t local_buf_size = sizeof(local_buf);
+    void* buf;
+    size_t buf_size;
+    size_t buf_size_size = sizeof(buf_size);
+
+    status = send_recv(ucp_worker, ep, &local_buf, local_buf_size);
+    if(status!=UCS_OK) return status;
+
+    status = send_recv(ucp_worker, ep, &rkey_buf_size, buf_size_size);
+    if(status!=UCS_OK) return status;
+
+    status = send_recv(ucp_worker, ep, rkey_buf, rkey_buf_size);
+    if(status!=UCS_OK) return status;
+
+    status = send_recv(ucp_worker, ep, &(rma_ctx.raddr), local_buf_size, false);
+    if(status!=UCS_OK) return status;
+
+    status = send_recv(ucp_worker, ep, &buf_size, buf_size_size, false);
+    if(status!=UCS_OK) return status;
+    buf = malloc(buf_size);
+
+    status = send_recv(ucp_worker, ep, buf, buf_size, false);
+    if(status!=UCS_OK) return status;
+
+    status = ucp_ep_rkey_unpack(ep, buf, &(rma_ctx.rkey));
+    if(status!=UCS_OK) return status;    
+
+    free(buf);
+    return UCS_OK;
+}
+
+ucs_status_t releaseRemoteAccessMemory(ucp_context_h ucp_context, ucp_mem_h mem_handle, void* rkey_buf){
+    ucs_status_t status;
+    
+    status = ucp_rkey_buffer_release(rkey_buf);
+    if(status!=UCS_OK) return status;
+
+    status = ucp_mem_unmap(ucp_context, mem_handle);
     return status;
 }
 
 
-ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, size_t data_counts, bool is_server){
+ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, int data_counts, bool is_server){
     float* data = NULL;
     ucs_status_t status;
-    data = new float(data_counts);
+    size_t data_size = 0;
+    data_size = sizeof(float)*data_counts;
+    
+    data = new float[data_counts];
     if(is_server){
         for(int i=0;i<data_counts;i++){
             data[i] = 1.1 + (i%2 == 0?i:i*(-1));
@@ -873,16 +1072,22 @@ ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, size_t data_cou
     }
     
     if(is_server){
-        status = send_recv(ucp_worker, ep, data, sizeof(float)*data_counts, true);
+        status = send_recv(ucp_worker, ep, data, data_size, true, ucp_communication_mode);
+        //status=UCS_OK;
     }else{
-        status = send_recv(ucp_worker, ep, data, sizeof(float)*data_counts, false);
+        status = send_recv(ucp_worker, ep, data, data_size, false, ucp_communication_mode);
+        //status=UCS_OK;
     }
-    if(status != UCS_OK) return status;
+    if(status != UCS_OK) {
+        delete []data;
+        return status;
+    }
 
-    fprint(stdout, is_server?"[Server]":"[Client]");
+    fprintf(stdout, is_server?"[Server]":"[Client]\n");
     for(int i=0;i<data_counts;i++){
-        fprintf(stdout, "%f", data[i]);
+        fprintf(stdout, "%f\n", data[i]);
     }
+    delete []data;
     return UCS_OK;
 }
 
@@ -890,60 +1095,43 @@ ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, size_t data_cou
 
 int main(int argc, char **argv)
 {
-    /* UCP temporary vars */
-    // ucp_params_t ucp_params;
-    // ucp_worker_params_t worker_params;
-    // ucp_config_t *config;
     ucs_status_t status;
 
     /* UCP handler objects */
     ucp_context_h ucp_context;
     ucp_worker_h ucp_worker;
     ucp_ep_h ep;
+    ucp_mem_h memh;
 
     /* OOB connection vars */
     uint64_t addr_len = 0;
     char *client_target_name = NULL;
     char *server_listen_name = NULL;
-    int ret = -1;
+    void *rma_buf = NULL;
+    size_t rma_buf_size = 100;
+    void *rkey_buf = NULL;
+    size_t rkey_buf_size;
+    int ret = 0;
 
-    // memset(&ucp_params, 0, sizeof(ucp_params));
-    // memset(&worker_params, 0, sizeof(worker_params));
 
     /* Parse the command line */
-    status = parse_cmd(argc, argv, &client_target_name);
+    status = parse_cmd(argc, argv, &client_target_name, &server_listen_name);
     CHKERR_JUMP(status != UCS_OK, "parse_cmd\n", err);
 
-    /* UCP initialization */
-    // status = ucp_config_read(NULL, NULL, &config);
-    // CHKERR_JUMP(status != UCS_OK, "ucp_config_read\n", err);
-
-    // ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
-    //                           UCP_PARAM_FIELD_REQUEST_SIZE |
-    //                           UCP_PARAM_FIELD_REQUEST_INIT;
-    // ucp_params.features     = UCP_FEATURE_TAG;
-    // if (ucp_wakeup_mode == WAKEUP_MODE_WAIT || ucp_wakeup_mode == WAKEUP_MODE_EVENTFD) {
-    //     ucp_params.features |= UCP_FEATURE_WAKEUP;
-    // }
-    // ucp_params.request_size    = sizeof(struct ucp_request_context);
-    // ucp_params.request_init    = request_init;
-
-    // status = ucp_init(&ucp_params, config, &ucp_context);
-
-    // ucp_config_print(config, stdout, NULL, UCS_CONFIG_PRINT_CONFIG);
-
-    // ucp_config_release(config);
-    // CHKERR_JUMP(status != UCS_OK, "ucp_init\n", err);
     status = createUcpContext(ucp_context);
     CHKERR_JUMP(status != UCS_OK, "createUcpContext\n", err);
 
-    // worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    // worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
+    fprintf(stdout, "UCP context created!\n");
 
-    // status = ucp_worker_create(ucp_context, &worker_params, &ucp_worker);
-    // CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+        rma_buf = malloc(rma_buf_size);
+        status = registAndPackRemoteAccessMemory(ucp_context, memh, rma_buf, rma_buf_size, rkey_buf, rkey_buf_size);
+    }
+
     status = createUcpWorker(ucp_context, ucp_worker);
     CHKERR_JUMP(status != UCS_OK, "ucp_worker_create\n", err_cleanup);
+
+    fprintf(stdout, "UCP worker created!\n");
 
     if(ucp_connect_mode != CONNECT_MODE_LISTENER){
         status = exchangeWorkerAddresses(ucp_worker, client_target_name);
@@ -953,63 +1141,51 @@ int main(int argc, char **argv)
         CHKERR_JUMP(status != UCS_OK, "ucp_worker_create_listener\n", err_worker);
     }
 
-
+    fprintf(stdout, "UCP connect prepared!\n");
     
-    // /* OOB connection establishment */
-    // if (client_target_name) {
-    //     peer_addr_len = local_addr_len;
-
-    //     oob_sock = client_connect(client_target_name, server_port);
-    //     CHKERR_JUMP(oob_sock < 0, "client_connect\n", err_addr);
-
-    //     ret = recv(oob_sock, &addr_len, sizeof(addr_len), MSG_WAITALL);
-    //     CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
-    //                        "receive address length\n", err_addr, ret);
-
-    //     peer_addr_len = addr_len;
-    //     peer_addr = malloc(peer_addr_len);
-    //     CHKERR_JUMP(!peer_addr, "allocate memory\n", err_addr);
-
-    //     ret = recv(oob_sock, peer_addr, peer_addr_len, MSG_WAITALL);
-    //     CHKERR_JUMP_RETVAL(ret != (int)peer_addr_len,
-    //                        "receive address\n", err_peer_addr, ret);
-    // } else {
-    //     oob_sock = server_connect(server_port);
-    //     CHKERR_JUMP(oob_sock < 0, "server_connect\n", err_peer_addr);
-
-    //     addr_len = local_addr_len;
-    //     ret = send(oob_sock, &addr_len, sizeof(addr_len), 0);
-    //     CHKERR_JUMP_RETVAL(ret != (int)sizeof(addr_len),
-    //                        "send address length\n", err_peer_addr, ret);
-
-    //     ret = send(oob_sock, local_addr, local_addr_len, 0);
-    //     CHKERR_JUMP_RETVAL(ret != (int)local_addr_len, "send address\n",
-    //                        err_peer_addr, ret);
-    // }
-
-    //ret = run_test(client_target_name, ucp_worker);
-
     status = establishConnection(ucp_worker, ep, client_target_name);
     CHKERR_JUMP(status != UCS_OK, "establish connection\n", err_worker);
 
-    status = communication(ucp_worker, ep, 10, client_target_name==NULL?false:true);
+    fprintf(stdout, "UCP connect established!\n");
+
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+        status = transferRemoteMemoryHandle(ucp_worker, ep, rma_buf, rkey_buf, rkey_buf_size);
+        CHKERR_JUMP(status != UCS_OK, "transfer remote memory handle\n", err_rma);
+    }
+
+    fprintf(stdout, "Remote access memory received!\n");
+
+    status = communication(ucp_worker, ep, 10, client_target_name==NULL?true:false);
     CHKERR_JUMP(status != UCS_OK, "communication\n", err_ep);
 
-    if (!ret && !err_handling_opt.failure) {
-        /* Make sure remote is disconnected before destroying local worker */
-        ret = barrier(oob_sock);
+    fprintf(stdout, "UCP communication finished!\n");
+
+    if (ucp_connect_mode == CONNECT_MODE_ADDRESS){
+        if(!ret && !err_handling_opt.failure) {
+            /* Make sure remote is disconnected before destroying local worker */
+            ret = barrier(oob_sock);
+            fprintf(stdout, "OOB Barriered!\n");
+        }
+        close(oob_sock);
     }
-    close(oob_sock);
 
-// err_peer_addr:
-//     free(peer_addr);
+    status = flush_ep(ucp_worker, ep);
+    CHKERR_JUMP(status != UCS_OK, "flush ep\n", err_worker);
 
-// err_addr:
-//     ucp_worker_release_address(ucp_worker, local_addr);
+err_rma:
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+        releaseRemoteAccessMemory(ucp_context, memh, rkey_buf);
+    }
+    free(rma_buf);
 
 err_ep:
-   ep_close(ucp_worker, ep); 
+    ucp_connect_mode==CONNECT_MODE_ADDRESS?ucp_ep_destroy(ep):ep_close(ucp_worker,ep);
 
+err_listener:
+    if(ucp_connect_mode==CONNECT_MODE_LISTENER && client_target_name==NULL){
+        ucp_listener_destroy(conn_ctx.listener);
+        fprintf(stdout, "listener has been destoried!\n");
+    } 
 err_worker:
     ucp_worker_destroy(ucp_worker);
 
@@ -1034,7 +1210,7 @@ static void usage(){
     fprintf(stderr, "  -e      Emulate unexpected failure on server side"
             "and handle an error on client side with enabled "
             "UCP_ERR_HANDLING_MODE_PEER\n");
-    fprintf(stderr, "  -n name Set node name or IP address "
+    fprintf(stderr, "  -n name Set node name or IP address (only IP address when listener connect mode)"
             "of the server (required for client and should be ignored "
             "for server)\n");
     fprintf(stderr, "  -l Set IP address where server listens "
@@ -1068,26 +1244,26 @@ static ucs_status_t parse_cmd(int argc, char * const argv[], char **server_name,
             err_handling_opt.failure        = 1;
             break;
         case 'w':
-            switch (optarg){
-                case 'w':ucp_wakeup_mode = WAKEUP_MODE_WAIT; break;
-                case 'e':ucp_wakeup_mode = WAKEUP_MODE_EVENTFD; break;
-                case 'p':ucp_wakeup_mode = WAKEUP_MODE_PROBE; break;
+            switch (int((char)*optarg)){
+                case int('w'):ucp_wakeup_mode = WAKEUP_MODE_WAIT; break;
+                case int('e'):ucp_wakeup_mode = WAKEUP_MODE_EVENTFD; break;
+                case int('p'):ucp_wakeup_mode = WAKEUP_MODE_PROBE; break;
                 default:fprintf(stderr,"Unsupport wakeup mode!\n");return UCS_ERR_UNSUPPORTED;
             }
             break;
         case 'c':
-            switch (optarg){
-                case 'a':ucp_connect_mode = CONNECT_MODE_ADDRESS; break;
-                case 'l':ucp_connect_mode = CONNECT_MODE_LISTENER; break;
+            switch (int((char)*optarg)){
+                case int('a'):ucp_connect_mode = CONNECT_MODE_ADDRESS; break;
+                case int('l'):ucp_connect_mode = CONNECT_MODE_LISTENER; break;
                 default:fprintf(stderr,"Unsupport connect mode!\n");return UCS_ERR_UNSUPPORTED;
             }
             break;
         case 'o':
-            switch (optarg){
-                case 't':ucp_communication_mode = COMMUNICATION_MODE_TAG; break;
-                case 'r':ucp_communication_mode = COMMUNICATION_MODE_RMA; break;
-                case 'a':ucp_communication_mode = COMMUNICATION_MODE_AM; break;
-                case 's':ucp_communication_mode = COMMUNICATION_MODE_STREAM; break;
+            switch (int((char)*optarg)){
+                case int('t'):ucp_communication_mode = COMMUNICATION_MODE_TAG; break;
+                case int('r'):ucp_communication_mode = COMMUNICATION_MODE_RMA; break;
+                case int('a'):ucp_communication_mode = COMMUNICATION_MODE_AM; break;
+                case int('s'):ucp_communication_mode = COMMUNICATION_MODE_STREAM; break;
                 default:fprintf(stderr,"Unsupport communication mode!\n");return UCS_ERR_UNSUPPORTED;
             }
             break;
