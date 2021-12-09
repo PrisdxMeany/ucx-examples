@@ -907,6 +907,7 @@ int main(int argc, char **argv)
 
     if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         rma_buf = malloc(rma_buf_size);
+        memset(rma_buf, client_target_name==NULL?0:1, rma_buf_size);
         status = registAndPackRemoteAccessMemory(ucp_context, memh, rma_buf, rma_buf_size, rkey_buf, rkey_buf_size);
     }
 
