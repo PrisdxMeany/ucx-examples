@@ -537,8 +537,12 @@ ucs_status_t establishConnection(ucp_worker_h& ucp_worker, ucp_ep_h& ep, const c
             } else {
                 /* ucp_tag_msg_recv_nb() cannot return NULL */
                 assert(UCS_PTR_IS_PTR(request));
-                ucx_wait(ucp_worker, request);
-                ((struct ucp_request_context*)request)->completed = 0;
+                //ucx_wait(ucp_worker, request);
+                while(((struct ucp_request_context*)request)->completed == 0){
+                    ucp_worker_progress(ucp_worker);
+                }
+                // ucx_wait(ucp_worker, &ctx);
+                // ((struct ucp_request_context*)request)->completed = 0;
                 ucp_request_release(request);
                 printf("UCX address message was received\n");
             }
@@ -680,6 +684,8 @@ ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
     // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
     ucp_request_param_t req_param;
     ucs_status_ptr_t request;
+    // ucp_atomic_op_t opcode = UCP_ATOMIC_OP_ADD;
+    ucp_atomic_post_op_t post_opcode = UCP_ATOMIC_POST_OP_ADD;
 
     req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                              UCP_OP_ATTR_FIELD_USER_DATA;
@@ -688,34 +694,20 @@ ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
     if(is_send){
         request = ucp_put_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
     }else{
-        request = ucp_get_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
+        //request = ucp_get_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
+        // req_param.op_attr_mask |= UCP_OP_ATTR_FIELD_DATATYPE;
+        // req_param.datatype = ucp_dt_make_contig(4);
+        ucs_status_t status;
+        status = ucp_atomic_post(ep, post_opcode, 1, 4, rma_ctx.raddr, rma_ctx.rkey);
+        request = UCS_STATUS_PTR(status);
     }
 
     return request;
 }
 
 ucs_status_ptr_t send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
-    // fprintf(stderr, "Can't support UCP-AM mode!\n");
-    // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
-    ucp_request_param_t req_param;
-    ucs_status_ptr_t request;
-    ucp_atomic_op_t opcode = UCP_ATOMIC_OP_ADD;
-    
-    req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                             UCP_OP_ATTR_FIELD_DATATYPE |
-                             UCP_OP_ATTR_FIELD_USER_DATA;
-    req_param.user_data    = &ctx;
-    req_param.datatype     = ucp_dt_make_contig(4);
-    req_param.cb.send = send_handler;
-
-    if(is_send){
-        request = ucp_atomic_op_nbx(ep, opcode, buf, buf_size/sizeof(float), rma_ctx.raddr, rma_ctx.rkey, &req_param);
-    }else{
-        opcode = UCP_ATOMIC_OP_AND;
-        request = ucp_atomic_op_nbx(ep, opcode, buf, buf_size/sizeof(float), rma_ctx.raddr, rma_ctx.rkey, &req_param);
-    }
-
-    return request;
+    fprintf(stderr, "Can't support UCP-AM mode!\n");
+    return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
 }
 
 ucs_status_ptr_t send_recv_stream(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
@@ -843,7 +835,7 @@ ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, int data_counts
     if(is_server){
         for(int i=0;i<data_counts;i++){
             data[i] = 1.1 + (i%2 == 0?i:i*(-1));
-            if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+            if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
                 ((float*)rma_buf)[i] = data[i];
             }
         }
@@ -853,6 +845,11 @@ ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, int data_counts
         status = send_recv(ucp_worker, ep, data, data_size, true, ucp_communication_mode);
         //status=UCS_OK;
     }else{
+        if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+            for(int i=0;i<data_counts;i++){
+                data[i] = 1.0;
+            }
+        }
         status = send_recv(ucp_worker, ep, data, data_size, false, ucp_communication_mode);
         //status=UCS_OK;
     }
@@ -865,7 +862,7 @@ ucs_status_t communication(ucp_worker_h ucp_worker, ucp_ep_h ep, int data_counts
     for(int i=0;i<data_counts;i++){
         fprintf(stdout, "%f\n", data[i]);
     }
-    if(ucp_communication_mode == COMMUNICATION_MODE_RMA){
+    if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         fprintf(stdout, is_server?"[Server]\n":"[Client]\n");
         for(int i=0;i<data_counts;i++){
             fprintf(stdout, "%f\n", ((float*)rma_buf)[i]);
@@ -907,7 +904,7 @@ int main(int argc, char **argv)
 
     if(ucp_communication_mode == COMMUNICATION_MODE_RMA || ucp_communication_mode == COMMUNICATION_MODE_AM){
         rma_buf = malloc(rma_buf_size);
-        memset(rma_buf, client_target_name==NULL?0:1, rma_buf_size);
+        memset(rma_buf, 0, rma_buf_size);
         status = registAndPackRemoteAccessMemory(ucp_context, memh, rma_buf, rma_buf_size, rkey_buf, rkey_buf_size);
     }
 
