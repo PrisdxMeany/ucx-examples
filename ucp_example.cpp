@@ -682,6 +682,9 @@ ucs_status_ptr_t send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
 ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, size_t& buf_size, ucp_request_context& ctx, bool is_send = true){
     // fprintf(stderr, "Can't support UCP-RMA mode!\n");
     // return UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
+    float* local_buf = (float*)buf;
+    float* reg_buf = (float*)rma_buf;
+
     ucp_request_param_t req_param;
     ucs_status_ptr_t request;
     // ucp_atomic_op_t opcode = UCP_ATOMIC_OP_ADD;
@@ -691,15 +694,50 @@ ucs_status_ptr_t send_recv_rma(ucp_worker_h ucp_worker, ucp_ep_h ep, void* buf, 
                              UCP_OP_ATTR_FIELD_USER_DATA;
     req_param.user_data    = &ctx;
     req_param.cb.send = send_handler;
+    //设置可用标志位，0表示不能用 1表示可用
+    reg_buf[24] = 0;
+    float flag = 0;
     if(is_send){
+        //更新数据
+        local_buf[1] = 10.0; 
+        local_buf[8] = 20.0; 
+        fprintf(stdout, "data updated!\n");
+        //先确保远端数据已用，再put
+        // do{
+        //     // flag = ucp_get(ep, &flag, sizeof(flag), rma_ctx.raddr+(24*sizeof(float)), rma_ctx.rkey);
+        // }while(flag == 0);
+        while(reg_buf[24] == 0){
+            sleep(1);
+        }
+        //像对端写入数据
         request = ucp_put_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
+        //通知对端数据已更新
+        //更新数据
+        // reg_buf[2] = 10.0;
+        // reg_buf[7] = 20.0;
+        // sleep(5);
+        // flag=1;
+        // ucp_put(ep, &flag, sizeof(flag), rma_ctx.raddr+(sizeof(float)*24), rma_ctx.rkey);
     }else{
+        //使用当前rmabuf中数据
+        sleep(5);
+        fprintf(stdout, "rma_buf[1]:%f, rma_buf[8]:%f\n", reg_buf[1], reg_buf[8]);
+        flag=1;
+        ucp_put(ep, &flag, sizeof(flag), rma_ctx.raddr+(sizeof(float)*24), rma_ctx.rkey);
+        sleep(5);
+        fprintf(stdout, "rma_buf[1]:%f, rma_buf[8]:%f\n", reg_buf[1], reg_buf[8]);
+
+
+
+        //告诉远端rma_buf可用
+        //fprintf(stdout, "buf[2]:%f, buf[7]:%f\n", local_buf[2], local_buf[7]);
+        //先确保对端已经更新再从远处get
         //request = ucp_get_nbx(ep, buf, buf_size, rma_ctx.raddr, rma_ctx.rkey, &req_param);
         // req_param.op_attr_mask |= UCP_OP_ATTR_FIELD_DATATYPE;
         // req_param.datatype = ucp_dt_make_contig(4);
-        ucs_status_t status;
-        status = ucp_atomic_post(ep, post_opcode, 1, 4, rma_ctx.raddr, rma_ctx.rkey);
-        request = UCS_STATUS_PTR(status);
+        // ucs_status_t status;
+        // status = ucp_atomic_post(ep, post_opcode, 1, 4, rma_ctx.raddr, rma_ctx.rkey);
+        // request = UCS_STATUS_PTR(status);
     }
 
     return request;
